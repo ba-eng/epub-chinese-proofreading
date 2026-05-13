@@ -1,0 +1,39 @@
+{
+  "_description": "EPUB 中文校对默认配置。可复制到工作目录作为 config.json 覆盖。",
+
+  "blacklist": [
+    "心头一颤",
+    "美眸",
+    "红唇",
+    "绝美",
+    "倾城",
+    "江湖",
+    "京城",
+    "门派",
+    "内力",
+    "眸子",
+    "俊脸",
+    "冷哼",
+    "嗤笑",
+    "不由得",
+    "话音刚落",
+    "目光如炬"
+  ],
+
+  "proofreading": {
+    "max_change_ratio": 0.4,
+    "long_text_threshold": 300,
+    "split_punctuation": ["。", "？", "！"],
+    "rules": {
+      "naturalize_word_order": true,
+      "remove_translation_patterns": true,
+      "trim_redundancy": true,
+      "minor_restructure": true,
+      "normalize_punctuation": true,
+      "enforce_glossary": true
+    }
+  },
+
+  "chapter_batch_size": 5,
+  "create_text_backup": true
+}

@@ -86,6 +86,30 @@ yarn-error.log*
 *.sln
 *.sw?
 
+# Layered-PSD local image backend configs
+image-backend.yaml
+image-backend.*.yaml
+*.local.yaml
+!image-backend.example.yaml
+!image-backend.aliyun.example.yaml
+!image-backend.apimart.example.yaml
+**/image-backend.yaml
+**/image-backend.*.yaml
+**/*.local.yaml
+!**/image-backend.example.yaml
+!**/image-backend.aliyun.example.yaml
+!**/image-backend.apimart.example.yaml
+
+# Layered-PSD generated/runtime files
+.claude/skills/layered-psd/output/
+.claude/skills/layered-psd/runtime/
+.claude/skills/layered-psd/.pytest_cache/
+.claude/skills/layered-psd/**/__pycache__/
+
 # Large binary files (optional，如果不想提交)
 # package/cli.js
 # package/cli.js.map
+__pycache__/
+
+# EPUB proofreading workspaces (per-book project directories)
+proofread/
