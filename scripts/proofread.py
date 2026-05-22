@@ -428,6 +428,10 @@ def proofread_text(text, glossary, blacklist):
 
     Phase A: Glossary replacement — regex-based, longest-term-first.
 
+    Phase A2: Semicolon (；) → comma (，) — mechanical replacement;
+      Chinese fiction uses semicolons extremely rarely; most are
+      English translation artifacts.
+
     Phase B: Blacklist FLAGGING (NOT skipping).
       Blacklist = undesirable网文 clichés that need to be replaced.
       Segments containing blacklist words are STILL PROOFREAD.
@@ -462,6 +466,14 @@ def proofread_text(text, glossary, blacklist):
             )
     else:
         processed = text
+
+    # Phase A2: Semicolon replacement — Chinese fiction uses ； extremely rarely.
+    # Most are English translation artifacts; replace with full-width comma.
+    # Skip English/predominantly-ASCII text to avoid corrupting code/HTML.
+    alpha = sum(1 for c in processed if c.isalpha())
+    eng = sum(1 for c in processed if c.isascii() and c.isalpha())
+    if not (eng > 0 and eng / max(alpha, 1) > 0.5):
+        processed = processed.replace('\uff1b', '\uff0c')
 
     # Phase B: Blacklist FLAGGING — mark for treatment, don't skip
     hits = [w for w in blacklist if w in processed]
