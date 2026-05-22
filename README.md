@@ -31,7 +31,7 @@ git clone https://github.com/kiloiam/epub-chinese-proofreading.git .claude/skill
 Claude 自动完成全部流程：
 1. 解包 EPUB，提取正文（过滤 CSS/JS/注释）
 2. 机械预处理（glossary 术语替换 + 网文词标记）
-3. 导出全文（150K 字自动分卷 + 上下文重叠）
+3. 导出全文（100K 字自动分卷 + 上下文重叠）
 4. 逐卷校对（术语统一、翻译腔修正、网文词替换）
 5. 检查改动量 → 二进制注入 → 打包输出
 
@@ -110,7 +110,7 @@ python scripts/proofread.py check --diff-log diff.txt ./work/
 
 ```bash
 cd scripts
-python test_regression.py    # 83 项单元测试
+python test_regression.py    # 86 项单元测试
 python test_e2e.py            # 62 步端到端测试
 python test_skill_workflow.py # 完整技能流程仿真
 ```
