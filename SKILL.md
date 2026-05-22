@@ -171,7 +171,7 @@ python "${CLAUDE_SKILL_DIR}/scripts/proofread.py" pack {work_dir}
 - 各 batch 的 corrections 条数：从每次 `apply-corrections` 的输出累加
 - check --diff 的输出可直接引用（已无剧透）
 
-## 步骤 5：第 3 轮文学润色（可选，需人工审核）
+## 步骤 5：第 3 轮文学润色（可选，需用户确认启动）
 
 第 1-2 轮完成的是**纠错级校对**（术语统一、黑名单替换、英文清除）。第 3 轮进入**文学润色**——提升散文质量，不改变原意和情节。
 
@@ -207,42 +207,39 @@ pack 完成后，**提示用户**：
 
 - **不改变情节、人物性格、对话原意**
 - **不统一的描写不强行统一**——角色视角变化带来的语气差异是合理的
-- **每处修改必须有明确理由**，写入 `reason` 字段
 - **不确定的不要改**——宁可漏过，不可过度润色
+- **禁止大面积重写**——每段修改量控制在原文 20% 以内（翻译腔改写除外）
 
 ### 操作流程
 
-**a) 生成润色建议（非自动应用）：**
+**与第 1-2 轮完全一致——全自动、无剧透、用户只看统计。**
 
-逐 batch 重新阅读。输出格式：
+a) 逐 batch 重新阅读（此时黑名单标记和英文段落应已全部消失，术语已统一）
+b) 按润色范围进行修正，输出标准 corrections.json 格式：
 
 ```json
-{"polish_suggestions": [{
-  "chapter": 3,
-  "segment_id": 15,
-  "category": "translation_ese|long_sentence|punctuation|voice|rhythm",
-  "original": "改写前的原文",
-  "proposed": "改写后的建议",
-  "reason": "改写理由（如：'被……所……'被动结构改为主动语态）"
-}]}
+{"corrections": [{"chapter": 3, "segment_id": 15, "corrected": "润色后全文"}]}
 ```
 
-**b) 保存到 `polish_suggestions.json`，不要 apply。告知用户建议数量。**
-**c) 用户审核后，将确认的建议写入 `corrections.json` 并 apply。**
-**d) 全部审核完成后，重新 check → inject → pack。**
+c) 每个 batch 完成后立即 `apply-corrections`
+d) 全部 batch 完成后：`check --diff` → `inject` → `pack`
+e) 输出无剧透统计报告（追加润色统计，见下）
+
+**用户全程不读正文**，只看到 pack 后的统计数据。与第 1-2 轮的无剧透保证一致。
 
 ### 润色统计（追加到校对报告）
 
 ```
 ### 第 3 轮润色
 
-| 类别 | 数量 | 采纳 |
-|------|------|------|
-| 翻译腔消除 | xx | xx |
-| 欧化长句拆分 | xx | xx |
-| 标点/数字规范 | xx | xx |
-| 角色声音增强 | xx | xx |
-| 朗读节奏 | xx | xx |
+| 类别 | 数量 |
+|------|------|
+| 翻译腔消除 | xx |
+| 欧化长句拆分 | xx |
+| 标点/数字规范 | xx |
+| 角色声音增强 | xx |
+| 朗读节奏优化 | xx |
+| 总修改段数 | xxx |
 ```
 
 ## 多轮校对
