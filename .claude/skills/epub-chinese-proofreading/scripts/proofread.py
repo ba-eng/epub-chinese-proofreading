@@ -413,11 +413,25 @@ def _build_glossary_regex(glossary):
 
     Longest terms first ensures that "房间里" matches before "房" or "门",
     preventing substring conflicts. Returns None if glossary is empty.
+
+    Also injects self-referencing entries for translation values that are
+    superstrings of their own keys (prefix-subset problem). Without this,
+    a key like "艾格勒莫"→"艾格勒莫特" would corrupt the canonical form
+    "艾格勒莫特" into "艾格勒莫特特" when the key matches within its own
+    translation during single-pass regex replacement.
     """
     if not glossary:
         return None
+    # Add self-entries for prefix-subset targets to prevent corruption.
+    # When key K is a proper prefix of its translation V, V must appear
+    # in the regex as a self-match (sorted before K by length) so that
+    # V is consumed by the longer match before K can match within V.
+    patched = dict(glossary)
+    for k, v in glossary.items():
+        if k != v and v.startswith(k):
+            patched.setdefault(v, v)
     # Sort by term length descending — longest match wins
-    sorted_terms = sorted(glossary.keys(), key=len, reverse=True)
+    sorted_terms = sorted(patched.keys(), key=len, reverse=True)
     escaped = [re.escape(t) for t in sorted_terms]
     pattern = '|'.join(escaped)
     return re.compile(pattern)
@@ -474,6 +488,19 @@ def proofread_text(text, glossary, blacklist):
     eng = sum(1 for c in processed if c.isascii() and c.isalpha())
     if not (eng > 0 and eng / max(alpha, 1) > 0.5):
         processed = processed.replace('\uff1b', '\uff0c')
+
+    # Phase A3: ASCII straight quotes → Chinese curly quotes.
+    # Alternating state machine: first " becomes \u201c, next becomes \u201d.
+    if '"' in processed:
+        result = []
+        left = True
+        for ch in processed:
+            if ch == '"':
+                result.append('\u201c' if left else '\u201d')
+                left = not left
+            else:
+                result.append(ch)
+        processed = ''.join(result)
 
     # Phase B: Blacklist FLAGGING — mark for treatment, don't skip
     hits = [w for w in blacklist if w in processed]
@@ -889,9 +916,15 @@ def cmd_apply_corrections(args):
     parse_errors = 0
     if json_blocks:
         for block in json_blocks:
-            # LLMs frequently produce trailing commas in JSON arrays/objects.
-            # Remove them before parsing to avoid silent data loss.
+            # LLMs frequently produce malformed JSON. Apply common fixes:
+            # 1. Trailing commas (most common LLM JSON error)
             block = re.sub(r',\s*([}\]])', r'\1', block)
+            # 2. JavaScript comments: // ... and /* ... */
+            block = re.sub(r'//[^\n]*', '', block)
+            block = re.sub(r'/\*.*?\*/', '', block, flags=re.DOTALL)
+            # 3. Unquoted keys: {key: → {"key": (but not inside strings)
+            block = re.sub(r'\{(\s*)([a-zA-Z_]\w*)\s*:', r'{\1"\2":', block)
+            block = re.sub(r',(\s*)([a-zA-Z_]\w*)\s*:', r',\1"\2":', block)
             try:
                 block_data = json.loads(block, strict=False)
                 for k, v in block_data.items():
@@ -976,25 +1009,41 @@ def cmd_apply_corrections(args):
                 # When data has sub-segments, keep "N.0" as "N.0" to match
                 # individual sub-segment key (not the merged _parts entry).
                 sid = _normalize_segment_id(raw_sid, keep_dot_zero=has_subs)
-                corrected = corr.get("corrected", "")
-                if sid in seg_map and corrected:
+                corrected = corr.get("corrected")
+                # Empty string is a valid correction (deletion of segment content).
+                # Use `corr.get("corrected") is not None` to distinguish "delete"
+                # from "no correction provided for this segment_id".
+                if sid in seg_map and corrected is not None:
                     target = seg_map[sid]
                     if "_parts" in target:
                         parts = target["_parts"]
                         if parts:
                             parts[0]["content"] = corrected
+                            # Also update original so inject can find the text
+                            if parts[0].get("original") is not None:
+                                parts[0]["original"] = corrected
                             for p in parts[1:]:
                                 p["content"] = ""
                         applied += 1
                     else:
                         target["content"] = corrected
+                        if target.get("original") is not None:
+                            target["original"] = corrected
                         applied += 1
 
             out_path = extracted_dir / f"chapter_{ch:04d}_corrected.json"
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(ch_data, f, ensure_ascii=False, indent=2)
             sentinel_path = extracted_dir / f"chapter_{ch:04d}.corrected"
+            # Touch sentinel BEFORE atomic data write. If crash occurs after
+            # sentinel touch, the sentinel exists and the old _corrected.json
+            # is still intact (atomic replace hasn't happened yet). Next run
+            # will use the old version and re-apply corrections on top.
+            # If crash occurs after atomic replace, both sentinel and data
+            # are consistent.
             sentinel_path.touch()
+            tmp_path = extracted_dir / f"chapter_{ch:04d}_corrected.json.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(ch_data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, out_path)
 
         print(f"  Corrections: {applied} applied to chapter_NNNN_corrected.json")
 
@@ -1062,6 +1111,16 @@ def add_term_to_glossary(term, translation, work_dir):
         True if term was newly added, False if already exists
     """
     glossary = load_glossary(work_dir)
+
+    # Validate: warn about targets with doubled CJK characters.
+    # These are usually LLM output errors (e.g. 野野蕾薇院) but can
+    # occasionally be legitimate (transliterated names like 迪迪埃).
+    doubled = re.findall(r'([\u4e00-\u9fff])\1', translation)
+    if doubled:
+        unique = set(doubled)
+        print(f"  WARNING: target '{translation}' has doubled CJK chars: {', '.join(c*2 for c in unique)}")
+        print(f"  This is often an LLM output error — please verify the canonical form is correct.")
+
     if term in glossary:
         if glossary[term] == translation:
             return False  # already exists with same value
@@ -1098,6 +1157,15 @@ def mechanical_proofreading_checks(original, proofread, config):
     for word in blacklist:
         if word in proofread and word not in original:
             issues.append(f"New blacklist word introduced: {word}")
+
+    # Check 3: Doubled CJK characters (LLM output artifact).
+    # Consecutive repeats of 3+ identical CJK characters (e.g. 特特特, 尔尔尔)
+    # are almost certainly generation artifacts. Legitimate triples are
+    # vanishingly rare in Chinese prose.
+    doubled = re.findall(r'([\u4e00-\u9fff])\1{2,}', proofread)
+    if doubled:
+        unique = set(doubled)
+        issues.append(f"Doubled CJK chars (generation artifact): {', '.join(c*3 for c in unique)}")
 
     return len(issues) == 0, issues
 
@@ -1167,11 +1235,22 @@ def add_terms_batch(terms_list, work_dir):
     added = updated = unchanged = 0
     chain_resolved = 0
 
+    rejected = 0
     for entry in terms_list:
         term = entry.get("term", "").strip()
         trans = entry.get("translation", "").strip()
         if not term or not trans:
             continue
+
+        # Validate: warn about targets with doubled CJK characters.
+        # These are usually LLM output errors (e.g. 野野蕾薇院) but can
+        # occasionally be legitimate (transliterated names like 迪迪埃).
+        doubled = re.findall(r'([\u4e00-\u9fff])\1', trans)
+        if doubled:
+            unique = set(doubled)
+            print(f"  WARNING: glossary_additions target '{trans}' has doubled CJK: {', '.join(c*2 for c in unique)}")
+            print(f"  This is often an LLM output error — please verify the canonical form is correct.")
+            rejected += 1
 
         # Resolve chains: if trans is itself a key, follow to final value
         original_trans = trans
@@ -1267,8 +1346,12 @@ def save_glossary(glossary, work_dir):
                     break
 
     path = Path(work_dir) / GLOSSARY_FILENAME
-    with open(path, "w", encoding="utf-8") as f:
+    # Atomic write: dump to temp file then replace.
+    # Prevents truncated glossary on crash or disk-full.
+    tmp_path = Path(work_dir) / (GLOSSARY_FILENAME + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(glossary, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
 
 
 def copy_glossary(src, work_dir):
@@ -1567,7 +1650,19 @@ def cmd_preprocess(args):
             # Flag English-heavy segments so ALL sub-segments get the marker
             alpha = sum(1 for c in processed if c.isalpha())
             eng = sum(1 for c in processed if c.isascii() and c.isalpha())
-            is_english = alpha >= 20 and eng > 0 and eng / max(alpha, 1) > 0.5
+            # Detect long ASCII runs (English sentences) within CJK text
+            max_ascii_run = 0
+            cur_run = 0
+            for c in processed:
+                if c.isascii() and c.isalpha():
+                    cur_run += 1
+                    max_ascii_run = max(max_ascii_run, cur_run)
+                else:
+                    cur_run = 0
+            has_english_run = max_ascii_run >= 30 or (
+                alpha >= 20 and eng > 0 and eng / max(alpha, 1) > 0.5
+            )
+            is_english = has_english_run
             sentences = split_long_text(processed, threshold, split_punc)
             total_sentences += len(sentences)
 
@@ -1866,8 +1961,10 @@ def cmd_reprocess(args):
                             seg["content"] = merged
                             merged_segments += 1
 
-            with open(corr_path, "w", encoding="utf-8") as f:
+            tmp_path = extracted_dir / f"chapter_{chapter:04d}_corrected.json.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(corr_data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, corr_path)
 
     if merged_segments:
         print(f"  _corrected.json: {merged_segments} segments 3-way merged with updated glossary")
@@ -1974,24 +2071,36 @@ def cmd_check(args):
                 change_ratio = compute_change_ratio(full_original, full_proofread)
                 max_change = config.get("proofreading", {}).get("max_change_ratio", 0.4)
                 if change_ratio > max_change:
-                    conservative = apply_mechanical_style_fixes(full_original)
-                    sentences = split_long_text(conservative, threshold, split_punc)
-                    # Do NOT insert in-place — that would shift indices for
-                    # other seg_groups whose cached indices become stale.
-                    # Instead, append to end and sort (id, sub_id) afterward.
-                    for j, sent in enumerate(sentences):
-                        if j < len(parts):
-                            parts[j][1]["content"] = sent
-                        else:
-                            new_part = dict(parts[0][1])
-                            new_part["sub_id"] = j
-                            new_part["content"] = sent
-                            new_part["original"] = ""
-                            segs.append(new_part)
-                    for j in range(len(sentences), len(parts)):
-                        parts[j][1]["content"] = ""
-                    total_reverted += 1
-                    chapter_reverted += 1
+                    # If this is _corrected.json (LLM-proofread), NEVER
+                    # overwrite LLM corrections with mechanical-only text.
+                    # The high change ratio is often intentional (e.g.,
+                    # translation-ese rewriting). Only auto-fix preprocessed
+                    # (mechanical-only) data.
+                    if proofread_path == corr_path:
+                        violations.append(
+                            f"  seg [{sid}] "
+                            f"change ratio {change_ratio:.2f} exceeds max {max_change} "
+                            f"(LLM-corrected segment; --fix skipped to preserve corrections)"
+                        )
+                    else:
+                        conservative = apply_mechanical_style_fixes(full_original)
+                        sentences = split_long_text(conservative, threshold, split_punc)
+                        # Do NOT insert in-place — that would shift indices for
+                        # other seg_groups whose cached indices become stale.
+                        # Instead, append to end and sort (id, sub_id) afterward.
+                        for j, sent in enumerate(sentences):
+                            if j < len(parts):
+                                parts[j][1]["content"] = sent
+                            else:
+                                new_part = dict(parts[0][1])
+                                new_part["sub_id"] = j
+                                new_part["content"] = sent
+                                new_part["original"] = ""
+                                segs.append(new_part)
+                        for j in range(len(sentences), len(parts)):
+                            parts[j][1]["content"] = ""
+                        total_reverted += 1
+                        chapter_reverted += 1
             if chapter_reverted:
                 segs.sort(key=lambda x: (x["id"], x.get("sub_id", 0)))
                 with open(proofread_path, "w", encoding="utf-8") as f:
@@ -2126,6 +2235,67 @@ def cmd_check(args):
         print("  All checks passed.")
     else:
         print(f"\n  Total violations: {total_violations}")
+
+    # --glossary: verify glossary coverage in HTML/XHTML files.
+    # Checks whether any glossary source keys still appear as raw text in the
+    # final output — indicating terms that the LLM or mechanical passes missed.
+    # Also validates the glossary itself for doubled-CJK targets (corrupted
+    # canonical forms like 野野蕾薇院).
+    do_glossary = getattr(args, 'glossary', False)
+    if do_glossary:
+        glossary = load_glossary(work_dir)
+        if not glossary:
+            print("\n  [glossary check] No glossary found.")
+        else:
+            # --- Self-validation: scan glossary for doubled-CJK targets ---
+            bad_targets = []
+            for term, target in glossary.items():
+                if term == target:
+                    continue
+                doubled = re.findall(r'([\u4e00-\u9fff])\1', target)
+                if doubled:
+                    bad_targets.append((term, target, set(doubled)))
+            if bad_targets:
+                print(f"\n  === Glossary self-check: {len(bad_targets)} entries with doubled CJK in target ===")
+                for term, target, chars in bad_targets:
+                    print(f"  {term} → {target}  (doubled: {', '.join(c*2 for c in chars)})")
+                print("  These targets are likely LLM output errors. Fix them with add-term or add-terms.")
+
+            # Collect all text content from HTML/XHTML files
+            html_text = ""
+            html_files = sorted(
+                list(Path(work_dir).rglob("*.xhtml")) +
+                list(Path(work_dir).rglob("*.html"))
+            )
+            for fp in html_files:
+                if any(p in ("extracted", "proofread_batches") for p in fp.parts):
+                    continue
+                with open(fp, "r", encoding="utf-8") as f:
+                    html_text += f.read()
+
+            # Check each CJK glossary key for residual occurrences
+            residual = []
+            for term, target in glossary.items():
+                # Only check CJK→CJK entries (ASCII keys like "Kushiel"→"库希尔"
+                # are already handled by English-term deletion in earlier passes)
+                if term == target:
+                    continue
+                if any(c.isascii() and c.isalpha() for c in term):
+                    continue
+                count = html_text.count(term)
+                if count > 0:
+                    residual.append((term, target, count))
+
+            if residual:
+                residual.sort(key=lambda x: -x[2])  # most frequent first
+                print(f"\n  === Glossary coverage check: {len(residual)} un-replaced terms ===")
+                for term, target, count in residual[:30]:
+                    print(f"  [{count:4d}] {term} → {target}")
+                if len(residual) > 30:
+                    print(f"  ... and {len(residual) - 30} more")
+            else:
+                print("\n  [glossary check] All CJK glossary terms applied — no residuals.")
+
     return 0 if total_violations == 0 else 1
 
 
@@ -2243,9 +2413,35 @@ def cmd_inject(args):
       2. Raw file bytes are modified in-place (binary string replace)
       3. This preserves original serialization perfectly (no namespace reordering,
          no self-closing tag flattening, no entity changes).
+
+    Before injecting, restores XHTML files from the source EPUB (if available
+    via context.json) to guarantee clean original text for binary matching.
+    Previous pack runs may have modified these files via glossary application,
+    making segment original text un-findable on subsequent inject passes.
     """
     work_dir = Path(args.work_dir)
     extracted_dir = work_dir / "extracted"
+
+    # --- Restore XHTML from source EPUB before injecting ---
+    context_path = work_dir / "context.json"
+    if context_path.exists():
+        with open(context_path, "r", encoding="utf-8") as f:
+            ctx = json.load(f)
+        input_epub = ctx.get("input_epub")
+        if input_epub and os.path.exists(input_epub):
+            import zipfile as _zipfile
+            with _zipfile.ZipFile(input_epub) as _zf:
+                restored = 0
+                for _n in _zf.namelist():
+                    if _n.endswith('.html') or _n.endswith('.xhtml'):
+                        # Use full ZIP internal path, not basename.
+                        # EPUBs commonly store XHTML in OEBPS/Text/ etc.
+                        _dest = work_dir / _n
+                        if _dest.exists():
+                            _zf.extract(_n, str(work_dir))
+                            restored += 1
+                if restored:
+                    print(f"  Restored {restored} XHTML files from source EPUB")
 
     index_path = extracted_dir / "index.json"
     if not index_path.exists():
@@ -2610,8 +2806,11 @@ def _apply_glossary_to_xhtml(work_dir):
         if content != original:
             m = re.search(r"encoding=['\x22]([^'\x22]+)['\x22]", original)
             enc = m.group(1) if m else "utf-8"
-            with open(fpath, "w", encoding=enc, errors="replace") as f:
+            # Atomic write to prevent truncated XHTML on crash
+            tmp_path = Path(str(fpath) + ".tmp")
+            with open(tmp_path, "w", encoding=enc, errors="replace") as f:
                 f.write(content)
+            os.replace(tmp_path, fpath)
             total += 1
 
     if total:
@@ -2657,10 +2856,11 @@ def cmd_pack(args):
                     continue
                 if filename in (GLOSSARY_FILENAME, FAILED_LIST_FILENAME,
                                 CONFIG_FILENAME, "context.json",
-                                "TASK.md", "full_text.txt", "diff.txt"):
+                                "TASK.md", "full_text.txt", "diff.txt",
+                                "voice_cards.md"):
                     continue
-                # Skip tooling .json files (EPUB has no .json in its spec)
-                if filename.endswith(".json"):
+                # Skip tooling .json and .md files (EPUB spec only uses .xhtml/.html)
+                if filename.endswith(".json") or filename.endswith(".md"):
                     continue
 
                 abs_path = os.path.join(root_dir, filename)
@@ -2744,7 +2944,7 @@ def _find_english_terms(extracted_dir, min_freq=3, top_n=30):
             data = json.load(f)
         for seg in data.get("segments", []):
             text = seg.get("content", "")
-            for m in re.finditer(r'\b[A-Za-z]{2,}\b', text):
+            for m in re.finditer(r'(?<![A-Za-z])[A-Za-z]{2,}(?![A-Za-z])', text):
                 w_lower = m.group().lower()
                 if w_lower not in _STOPWORDS:
                     tokens[w_lower] += 1  # case-insensitive counting
@@ -3478,6 +3678,7 @@ def main():
     p_check.add_argument("--fix", action="store_true", help="Auto-revert over-changed segments to conservative")
     p_check.add_argument("--diff", action="store_true", help="Show changed segments summary")
     p_check.add_argument("--diff-log", help="Write detailed before/after diff to FILE (spoiler warning included)")
+    p_check.add_argument("--glossary", action="store_true", help="Verify glossary coverage: check HTML for un-replaced term keys")
 
     p_dump = sub.add_parser("dump-text", help="Dump all extracted text for LLM proofreading")
     p_dump.add_argument("work_dir", help="Work directory")
