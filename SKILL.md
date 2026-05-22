@@ -51,6 +51,10 @@ python "${CLAUDE_SKILL_DIR}/scripts/proofread.py" pipeline "EPUB文件路径"
 - `[? 英文段落]`（有相邻中文译文）已由 pipeline 自动删除，**跳过**
 - `[? 英文段落·待翻译]`（无相邻中文译文）→ 翻译为中文
 - 修正 AI 套话、翻译腔、风格突变。翻译腔对照 `references/publishing-standards.md` 的 7 种常见模式逐段检查
+- **角色声调对照**：读到角色对话时，对照 `voice_cards.md` 验证：
+  - 该角色的说话风格是否与声调卡中一致？（文雅/粗鄙/简洁/啰嗦）
+  - 是否有同一个角色在本 batch 里「换了声音」？
+  - 若发现不一致，写入 corrections 调整为统一口吻
 - 同样逐 batch 深度阅读，不可跳过
 
 ### 校对输出格式
