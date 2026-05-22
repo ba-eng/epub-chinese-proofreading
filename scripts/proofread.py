@@ -14,6 +14,7 @@ Commands:
 """
 
 import argparse
+import difflib
 import html
 import json
 import math
@@ -448,8 +449,7 @@ def proofread_text(text, glossary, blacklist):
     # Short CJK glossary terms (e.g. "他"→"他") would match inside
     # English words (e.g. "he"→"他", corrupting "she"→"s他").
     if glossary:
-        alpha = sum(1 for c in text if c.isalpha())
-        # Guard: if text is predominantly ASCII alpha, skip glossary.
+        # Guard: if text is predominantly ASCII alpha, skip glo.
         # Without this, short CJK glossary terms like "他" would match
         # inside English words ("he"→"他", corrupting "she"→"s他").
         alpha = sum(1 for c in text if c.isalpha())
@@ -584,12 +584,25 @@ def _dump_chapter_lines(chapter, data):
 
 
 def _iter_dump_chapters(index, extracted_dir):
-    """Yield (chapter, header, body_lines, char_count) for each chapter."""
+    """Yield (chapter, header, body_lines, char_count) for each chapter.
+
+    Prefers _corrected.json (LLM-proofread text) over _preprocessed.json
+    (mechanical glossary + style fixes) over raw extract. This ensures
+    round 2 sees round 1's corrections rather than re-reading stale text.
+    """
     for item in index:
         chapter = item["chapter"]
+        corr_path = extracted_dir / f"chapter_{chapter:04d}_corrected.json"
+        corr_sentinel = extracted_dir / f"chapter_{chapter:04d}.corrected"
         pp_path = extracted_dir / f"chapter_{chapter:04d}_preprocessed.json"
         raw_path = extracted_dir / f"chapter_{chapter:04d}.json"
-        read_path = pp_path if pp_path.exists() else raw_path
+
+        if corr_path.exists() and corr_sentinel.exists():
+            read_path = corr_path
+        elif pp_path.exists():
+            read_path = pp_path
+        else:
+            read_path = raw_path
         if not read_path.exists():
             continue
         with open(read_path, "r", encoding="utf-8") as f:
@@ -622,6 +635,100 @@ def _write_batch(batch_dir, num, lines, start_ch, end_ch):
     fname = f"batch_{num:02d}_ch{start_ch:04d}_to_{end_ch:04d}.txt"
     with open(batch_dir / fname, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+
+
+def _redump_batches(work_dir):
+    """Regenerate batch files from current _preprocessed.json content.
+
+    Called after reprocess updates the glossary so that batch files
+    reflect the latest term replacements. Without this, subsequent
+    proofreading rounds see stale text with old variant forms.
+    """
+    extracted_dir = Path(work_dir) / "extracted"
+    batch_dir = Path(work_dir) / "proofread_batches"
+    index_path = extracted_dir / "index.json"
+
+    if not index_path.exists():
+        return
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        index = json.load(f)
+
+    # Read max_chars from config, default to 80000
+    config = load_config(work_dir)
+    max_chars = config.get("proofreading", {}).get("max_chars", 0) or 80000
+
+    # Collect all chapters
+    all_lines = []
+    total_chars = 0
+    chapters = []
+    for ch, hdr, body, chars in _iter_dump_chapters(index, extracted_dir):
+        chapters.append((ch, hdr, body, chars))
+        all_lines.extend(hdr)
+        all_lines.extend(body)
+        total_chars += chars
+
+    # Rewrite full text
+    out_path = Path(work_dir) / "full_text.txt"
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(all_lines))
+
+    # Regenerate batches
+    if batch_dir.exists():
+        for f in batch_dir.glob("batch_*.txt"):
+            f.unlink()
+    batch_dir.mkdir(exist_ok=True)
+
+    batch_num = 1
+    batch_chars = 0
+    batch_lines = []
+    batch_start_ch = None
+    batch_end_ch = None
+    OVERLAP_CHARS = 2000
+    prev_batch_tail = None
+
+    for ch, hdr, body, chars in chapters:
+        if chars > max_chars:
+            if batch_lines:
+                _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch)
+                prev_batch_tail = _extract_tail(batch_lines, OVERLAP_CHARS)
+                batch_num += 1
+                batch_lines, batch_chars = [], 0
+                batch_start_ch = None
+            chunk = []
+            if prev_batch_tail:
+                chunk.append(f"\n[Previous Context]\n{prev_batch_tail}\n[/Previous Context]\n")
+            chunk.extend(hdr + body)
+            _write_batch(batch_dir, batch_num, chunk, ch, ch)
+            prev_batch_tail = _extract_tail(hdr + body, OVERLAP_CHARS)
+            batch_num += 1
+            continue
+
+        if batch_chars + chars > max_chars and batch_lines:
+            _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch)
+            prev_batch_tail = _extract_tail(batch_lines, OVERLAP_CHARS)
+            batch_num += 1
+            batch_lines, batch_chars = [], 0
+            batch_start_ch = None
+
+        if batch_start_ch is None:
+            batch_start_ch = ch
+            if prev_batch_tail:
+                batch_lines.append(
+                    f"\n[Previous Context — 只读参考]\n{prev_batch_tail}\n"
+                    f"[/Previous Context]\n"
+                    f"[BOUNDARY CHECK — 对比此标记前后 3 段：语气、节奏、"
+                    f"用词是否平滑衔接？若有风格突变，写入 corrections]\n"
+                )
+        batch_end_ch = ch
+        batch_lines.extend(hdr)
+        batch_lines.extend(body)
+        batch_chars += chars
+
+    if batch_lines:
+        _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch)
+
+    print(f"  Batch files regenerated: {batch_num} batch(es) in {batch_dir}/")
 
 
 def cmd_dump_text(args):
@@ -691,7 +798,12 @@ def cmd_dump_text(args):
                     batch_start_ch = None
                 chunk = []
                 if prev_batch_tail:
-                    chunk.append(f"\n[Previous Context — 只读参考，勿修改此段]\n{prev_batch_tail}\n[/Previous Context]\n")
+                    chunk.append(
+                    f"\n[Previous Context — 只读参考]\n{prev_batch_tail}\n"
+                    f"[/Previous Context]\n"
+                    f"[BOUNDARY CHECK — 对比此标记前后 3 段：语气、节奏、"
+                    f"用词是否平滑衔接？若有风格突变，写入 corrections]\n"
+                )
                 chunk.extend(hdr + body)
                 _write_batch(batch_dir, batch_num, chunk, ch, ch)
                 prev_batch_tail = _extract_tail(hdr + body, OVERLAP_CHARS)
@@ -712,8 +824,9 @@ def cmd_dump_text(args):
                 # Prepend overlap from previous batch as read-only context
                 if prev_batch_tail:
                     batch_lines.append(
-                        f"\n[Previous Context — 只读参考，勿修改此段]\n{prev_batch_tail}"
+                        f"\n[Previous Context — 只读参考]\n{prev_batch_tail}"
                         f"\n[/Previous Context]\n"
+                        f"[BOUNDARY CHECK — 对比此标记前后 3 段]\n"
                     )
             batch_end_ch = ch
             batch_lines.extend(hdr)
@@ -798,7 +911,7 @@ def cmd_apply_corrections(args):
     # 1. Add glossary terms
     glossary_additions = data.get("glossary_additions", [])
     if glossary_additions:
-        added, updated, unchanged = add_terms_batch(glossary_additions, work_dir)
+        added, updated, unchanged, chain_resolved = add_terms_batch(glossary_additions, work_dir)
         print(f"  Glossary: {added} added, {updated} updated, {unchanged} unchanged")
 
     # 2. Apply corrections FIRST — write LLM text to _corrected.json
@@ -1025,21 +1138,40 @@ def apply_mechanical_style_fixes(text):
 def add_terms_batch(terms_list, work_dir):
     """Add multiple terms to glossary at once.
 
+    Automatically resolves glossary chains (A→B, B→C): if a new term's
+    translation is itself a glossary key that maps elsewhere, the term is
+    remapped directly to the chain's final value. This is necessary because
+    re.subn is single-pass — without it, A→B happens but B→C never follows,
+    leaving intermediate forms "stuck" in the text.
+
     Args:
         terms_list: list of {"term": str, "translation": str} dicts
         work_dir: path to work directory
 
     Returns:
-        (added, updated, unchanged) counts
+        (added, updated, unchanged, chain_resolved) counts
     """
     glossary = load_glossary(work_dir)
     added = updated = unchanged = 0
+    chain_resolved = 0
 
     for entry in terms_list:
         term = entry.get("term", "").strip()
         trans = entry.get("translation", "").strip()
         if not term or not trans:
             continue
+
+        # Resolve chains: if trans is itself a key, follow to final value
+        original_trans = trans
+        seen = {trans}
+        while trans in glossary and glossary[trans] != trans:
+            trans = glossary[trans]
+            if trans in seen:
+                break  # circular reference, stop
+            seen.add(trans)
+        if trans != original_trans:
+            chain_resolved += 1
+
         if term in glossary:
             if glossary[term] == trans:
                 unchanged += 1
@@ -1050,8 +1182,29 @@ def add_terms_batch(terms_list, work_dir):
             glossary[term] = trans
             added += 1
 
+    # After all terms are added, do a full pass to resolve all chains.
+    # This also fixes existing entries that were added before their
+    # translation became a key (e.g. A->B was added, then B->C was added
+    # later — A should now map to C directly).
+    retro_fixed = 0
+    for k, v in glossary.items():
+        original_v = v
+        seen = {v}
+        while v in glossary and glossary[v] != v:
+            v = glossary[v]
+            if v in seen:
+                break  # circular reference, stop
+            seen.add(v)
+        if v != original_v:
+            glossary[k] = v
+            retro_fixed += 1
+
     save_glossary(glossary, work_dir)
-    return added, updated, unchanged
+    total_chain = chain_resolved + retro_fixed
+    if total_chain:
+        print(f"  Chains resolved: {total_chain} entries remapped to final canonical form "
+              f"({chain_resolved} new, {retro_fixed} retroactive)")
+    return added, updated, unchanged, chain_resolved + retro_fixed
 
 
 # ---------------------------------------------------------------------------
@@ -1068,7 +1221,39 @@ def load_glossary(work_dir):
 
 
 def save_glossary(glossary, work_dir):
-    """Save glossary to work directory."""
+    """Save glossary to work directory.
+
+    Before saving, auto-generates identity mappings for glossary values
+    that contain expandable glossary keys as substrings. This prevents the
+    "substring expansion" bug where "菲德"→"菲德蕾" causes the existing
+    word "菲德蕾" to be split into "菲德"+"蕾"→"菲德蕾蕾".
+
+    Only CJK values (no ASCII letters) are protected, since ASCII-key
+    glossary entries handle English→Chinese and don't affect existing
+    Chinese text.
+    """
+    # Find expandable keys: CJK keys whose translation is longer than the key
+    expandable = {}
+    for k, v in glossary.items():
+        if len(v) > len(k) and not any(c.isascii() and c.isalpha() for c in k):
+            expandable[k] = v
+
+    if expandable:
+        # For each glossary value, check if any expandable key is a substring.
+        # If so, ensure the value has an identity mapping to protect it.
+        added = 0
+        for v in list(glossary.values()):
+            if any(c.isascii() and c.isalpha() for c in v):
+                continue  # skip values with ASCII (they're English→Chinese targets)
+            if v in glossary and glossary[v] == v:
+                continue  # already has identity mapping
+            for k in expandable:
+                if k in v and k != v:
+                    if v not in glossary:
+                        glossary[v] = v  # identity mapping
+                        added += 1
+                    break
+
     path = Path(work_dir) / GLOSSARY_FILENAME
     with open(path, "w", encoding="utf-8") as f:
         json.dump(glossary, f, ensure_ascii=False, indent=2)
@@ -1417,7 +1602,121 @@ def cmd_preprocess(args):
     print(f"  Dump text for LLM: python proofread.py dump-text {work_dir}")
     print(f"\n  Summary: {total_blacklisted} segments flagged, "
           f"{total_sentences} sentences ready for phase C")
+
     return 0
+
+
+def _three_way_merge(old_pp_content, corrected_content, new_pp_content, _depth=0):
+    """Apply LLM edits (old_pp→corrected) onto new preprocessed text.
+
+    Uses difflib to compute the LLM's changes relative to the OLD
+    preprocessed base, then applies those same edits to the NEW
+    preprocessed base. This prevents cascading double-replacement when
+    a glossary translation contains another glossary term (叠字 bug).
+
+    The merge works by:
+      1. Diffing old_pp vs corrected to find LLM's edit operations
+      2. Diffing old_pp vs new_pp to map character positions
+      3. Applying LLM's edit operations to the corresponding positions
+         in new_pp, using the position map from step 2
+
+    Args:
+        old_pp_content: Old preprocessed text (base both deltas are from)
+        corrected_content: LLM-corrected text (base + LLM edits)
+        new_pp_content: New preprocessed text (base + glossary updates)
+        _depth: Internal recursion guard (max 3 levels)
+
+    Returns:
+        Merged text with both glossary updates and LLM edits.
+    """
+    if corrected_content == old_pp_content:
+        return new_pp_content
+
+    # Build position map: old_pp[i] → new_pp[j]
+    align = difflib.SequenceMatcher(None, old_pp_content, new_pp_content)
+
+    def _map_pos(old_pos):
+        """Map a character position from old_pp to new_pp."""
+        prev_j2 = 0
+        for tag, i1, i2, j1, j2 in align.get_opcodes():
+            if i1 <= old_pos < i2:
+                if tag == 'equal':
+                    return j1 + (old_pos - i1)
+                elif tag == 'replace':
+                    ratio = (old_pos - i1) / max(i2 - i1, 1)
+                    return int(j1 + ratio * (j2 - j1))
+                elif tag == 'delete':
+                    return j1
+                elif tag == 'insert':
+                    return j2
+            elif old_pos == i2:
+                # Position is at the boundary between blocks.
+                # Map to the end of the corresponding block in new_pp.
+                if tag == 'equal':
+                    prev_j2 = j2
+                elif tag == 'replace':
+                    prev_j2 = j2
+                elif tag == 'delete':
+                    prev_j2 = j1  # deleted text maps to insertion point
+            elif old_pos == i1 and old_pos == i2:
+                return prev_j2
+            prev_j2 = j2
+        return prev_j2
+
+    # Build result by applying LLM edits to new_pp
+    edits = difflib.SequenceMatcher(None, old_pp_content, corrected_content)
+    result = []
+    new_pos = 0
+
+    for tag, i1, i2, j1, j2 in edits.get_opcodes():
+        if tag == 'equal':
+            # LLM kept this chunk. Map to new_pp.
+            mapped_start = _map_pos(i1)
+            mapped_end = _map_pos(i2)
+            if mapped_start is not None and mapped_end is not None:
+                if new_pos < mapped_start:
+                    result.append(new_pp_content[new_pos:mapped_start])
+                result.append(new_pp_content[mapped_start:mapped_end])
+                new_pos = mapped_end
+        elif tag == 'replace':
+            # LLM replaced old_pp[i1:i2] with corrected[j1:j2].
+            # Map the replace range to new_pp and apply the LLM's text.
+            mapped_start = _map_pos(i1)
+            mapped_end = _map_pos(i2)
+            if mapped_start is not None and mapped_end is not None:
+                if new_pos < mapped_start:
+                    result.append(new_pp_content[new_pos:mapped_start])
+                new_pp_chunk = new_pp_content[mapped_start:mapped_end]
+                old_chunk = old_pp_content[i1:i2]
+                llm_chunk = corrected_content[j1:j2]
+                if new_pp_chunk != old_chunk:
+                    # Glossary already changed this region.
+                    # If LLM's change is unrelated to the glossary change,
+                    # apply LLM's edit to new_pp_chunk using a sub-merge.
+                    if _depth >= 3:
+                        result.append(llm_chunk)  # max recursion, prefer LLM
+                    else:
+                        sub = _three_way_merge(old_chunk, llm_chunk, new_pp_chunk, _depth + 1)
+                        result.append(sub)
+                else:
+                    result.append(llm_chunk)
+                new_pos = mapped_end
+        elif tag == 'delete':
+            # LLM deleted this chunk. Skip it in result.
+            mapped_start = _map_pos(i1)
+            mapped_end = _map_pos(i2)
+            if mapped_start is not None and mapped_end is not None:
+                if new_pos < mapped_start:
+                    result.append(new_pp_content[new_pos:mapped_start])
+                new_pos = mapped_end
+        elif tag == 'insert':
+            # LLM inserted text. Place it at the current position.
+            result.append(corrected_content[j1:j2])
+
+    if new_pos < len(new_pp_content):
+        result.append(new_pp_content[new_pos:])
+
+    return ''.join(result)
 
 
 def cmd_reprocess(args):
@@ -1450,16 +1749,27 @@ def cmd_reprocess(args):
 
     total_blacklisted = 0
     total_sentences = 0
+    merged_segments = 0
 
     for item in index:
         chapter = item["chapter"]
-        # _preprocessed.json must ALWAYS be built from raw extract
-        # (chapter_NNNN.json) — never from LLM-corrected text. Using
-        # _corrected.json as source would copy LLM edits into the
-        # "original" field, breaking change-ratio safety checks.
         orig_path = extracted_dir / f"chapter_{chapter:04d}.json"
         if not orig_path.exists():
             continue
+
+        preproc_path = extracted_dir / f"chapter_{chapter:04d}_preprocessed.json"
+        corr_path = extracted_dir / f"chapter_{chapter:04d}_corrected.json"
+        corr_sentinel = extracted_dir / f"chapter_{chapter:04d}.corrected"
+
+        # Read OLD _preprocessed.json BEFORE overwriting — needed as the
+        # base for 3-way merge of _corrected.json content.
+        old_preproc_data = None
+        if preproc_path.exists() and corr_path.exists() and corr_sentinel.exists():
+            try:
+                with open(preproc_path, "r", encoding="utf-8") as f:
+                    old_preproc_data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
 
         with open(orig_path, "r", encoding="utf-8") as f:
             chapter_data = json.load(f)
@@ -1485,7 +1795,6 @@ def cmd_reprocess(args):
                     "blacklist_hits": bl_hits
                 })
 
-        preproc_path = extracted_dir / f"chapter_{chapter:04d}_preprocessed.json"
         out = {
             "chapter": chapter,
             "file": chapter_data.get("file", ""),
@@ -1498,26 +1807,64 @@ def cmd_reprocess(args):
         print(f"  [{chapter:04d}] {chapter_data.get('file', '')} — reprocessed "
               f"({sum(1 for s in proofread_segments if s.get('blacklisted'))} blacklisted)")
 
-        # If _corrected.json with sentinel exists, also apply new glossary
-        # terms to its content (but preserve "original" fields).
-        corr_path = extracted_dir / f"chapter_{chapter:04d}_corrected.json"
-        corr_sentinel = extracted_dir / f"chapter_{chapter:04d}.corrected"
-        if corr_path.exists() and corr_sentinel.exists():
+        # Update _corrected.json via 3-way merge, not by re-applying glossary.
+        # Re-applying proofread_text to already-processed text causes cascading
+        # double-replacement (the 叠字 bug) when a translation contains another
+        # glossary term. The merge computes LLM edits relative to old preprocessed
+        # and applies them to new preprocessed, avoiding the cascade.
+        if old_preproc_data is not None and corr_path.exists() and corr_sentinel.exists():
             with open(corr_path, "r", encoding="utf-8") as f:
                 corr_data = json.load(f)
+
+            # Build lookup maps keyed by segment + sub_id
+            old_pp_map = {}
+            for s in old_preproc_data.get("segments", []):
+                key = f"{s['id']}.{s.get('sub_id', 0)}"
+                old_pp_map[key] = s.get("content", "")
+
+            new_pp_map = {}
+            for s in proofread_segments:
+                key = f"{s['id']}.{s.get('sub_id', 0)}"
+                new_pp_map[key] = s.get("content", "")
+
             for seg in corr_data.get("segments", []):
-                content = seg.get("content", "")
-                alpha = sum(1 for c in content if c.isalpha())
-                eng = sum(1 for c in content if c.isascii() and c.isalpha())
-                if eng > 0 and eng / max(alpha, 1) > 0.5:
-                    continue  # skip glossary on English text
-                new_content, _, _ = proofread_text(content, glossary, [])
-                if new_content != content:
-                    seg["content"] = new_content
+                key = f"{seg['id']}.{seg.get('sub_id', 0)}"
+                old_pp = old_pp_map.get(key, "")
+                new_pp = new_pp_map.get(key, "")
+                corrected = seg.get("content", "")
+
+                if not old_pp or not new_pp:
+                    continue
+                if old_pp == new_pp:
+                    continue  # No glossary change for this segment
+                if corrected == old_pp:
+                    seg["content"] = new_pp  # No LLM edits, use new pp
+                    merged_segments += 1
+                else:
+                    # Safety check: if LLM rewrote the segment heavily
+                    # (LCS ratio < 0.4), skip merge and keep corrected.
+                    # Character-level merge on Chinese heavy-rewrites
+                    # can produce truncated/incorrect output.
+                    lcs = difflib.SequenceMatcher(None, old_pp, corrected).ratio()
+                    if lcs < 0.4:
+                        seg["content"] = corrected  # keep LLM version as-is
+                    else:
+                        merged = _three_way_merge(old_pp, corrected, new_pp)
+                        if merged != corrected:
+                            seg["content"] = merged
+                            merged_segments += 1
+
             with open(corr_path, "w", encoding="utf-8") as f:
                 json.dump(corr_data, f, ensure_ascii=False, indent=2)
 
+    if merged_segments:
+        print(f"  _corrected.json: {merged_segments} segments 3-way merged with updated glossary")
+
     print(f"\n  Reprocess complete: {total_blacklisted} flagged, {total_sentences} sentences")
+
+    # Regenerate batch files so LLM sees fresh text with latest glossary
+    _redump_batches(args.work_dir)
+
     return 0
 
 
@@ -2071,6 +2418,33 @@ def cmd_inject(args):
                             orig_len = len(orig)
                             escaped = True
                             entity_form = 'decimal'
+                    # CJK numeric entities: some EPUB tools (Sigil, early
+                    # Calibre) encode CJK characters as &#xNNNN;. lxml
+                    # decodes these to characters, but raw file bytes retain
+                    # the entity form. Try hex-encoding all CJK chars.
+                    if idx == -1:
+                        has_cjk = any('\u4e00' <= c <= '\u9fff' or
+                                      '\u3400' <= c <= '\u4dbf' or
+                                      '\uf900' <= c <= '\ufaff'
+                                      for c in orig)
+                        if has_cjk:
+                            orig_cjk_hex = html.escape(orig)
+                            cjk_buf = list(orig_cjk_hex)
+                            i = 0
+                            while i < len(cjk_buf):
+                                cp = ord(cjk_buf[i])
+                                if (0x4e00 <= cp <= 0x9fff or
+                                    0x3400 <= cp <= 0x4dbf or
+                                    0xf900 <= cp <= 0xfaff):
+                                    cjk_buf[i] = f'&#x{cp:x};'
+                                i += 1
+                            orig_cjk_hex = ''.join(cjk_buf)
+                            idx = content.find(orig_cjk_hex, last_idx)
+                            if idx != -1:
+                                orig = orig_cjk_hex
+                                orig_len = len(orig)
+                                escaped = True
+                                entity_form = 'cjk_hex'
                 if idx != -1:
                     if orig != repl:
                         # Always escape for XML safety — LLM may have
@@ -2082,7 +2456,7 @@ def cmd_inject(args):
                                     cp = ord(char)
                                     if entity_form == 'decimal':
                                         repl_final = repl_final.replace(char, f'&#{cp};')
-                                    elif entity_form == 'hex':
+                                    elif entity_form in ('hex', 'cjk_hex'):
                                         repl_final = repl_final.replace(char, f'&#x{cp:x};')
                                     else:
                                         repl_final = repl_final.replace(char, _entity)
@@ -2093,6 +2467,17 @@ def cmd_inject(args):
                                     repl_final = repl_final.replace(char, _entity)
                                 # hex/decimal: leave the multi-char entity as-is
                                 # (it was already generated in correct form by html.escape)
+                        # For CJK entity files, encode ALL CJK in replacement
+                        if entity_form == 'cjk_hex':
+                            buf = list(repl_final)
+                            for i in range(len(buf)):
+                                cp = ord(buf[i])
+                                if (0x4e00 <= cp <= 0x9fff or
+                                    0x3400 <= cp <= 0x4dbf or
+                                    0xf900 <= cp <= 0xfaff):
+                                    buf[i] = f'&#x{cp:x};'
+                            repl_final = ''.join(buf)
+
                         content = content[:idx] + repl_final + content[idx + len(orig):]
                         last_idx = idx + len(repl_final)
                     else:
@@ -2141,7 +2526,11 @@ def cmd_inject(args):
 
 
 def _apply_glossary_to_xhtml(work_dir):
-    """Apply glossary ASCII-term translations directly to XHTML text content.
+    """Apply ALL glossary translations directly to XHTML text content.
+
+    Handles both ASCII→Chinese (e.g. "Kushiel"→"库希尔") and Chinese→Chinese
+    (e.g. "菲德蕾蕾"→"菲德蕾") mappings. This catches terms that were missed
+    by inject due to text nodes that couldn't be located in the raw XHTML.
 
     Uses rglob to find .html/.xhtml in subdirectories (EPUBs commonly place
     them under OEBPS/Text/). Extracts <style>/<script> blocks before regex
@@ -2150,12 +2539,21 @@ def _apply_glossary_to_xhtml(work_dir):
     glossary = load_glossary(work_dir)
     if not glossary:
         return
+
+    # Split into two sets for reporting, but process all in one regex.
     ascii_terms = {k: v for k, v in glossary.items()
                    if any(c.isascii() and c.isalpha() for c in k)}
-    if not ascii_terms:
-        return
+    cjk_terms = {k: v for k, v in glossary.items()
+                 if not any(c.isascii() and c.isalpha() for c in k)}
+
+    # Build single unified regex (longest-first) for ALL terms.
+    # This handles both English→Chinese AND Chinese→Chinese in one pass,
+    # preventing inject-skipped segments from retaining old variant forms.
+    all_regex = _build_glossary_regex(glossary)
 
     total = 0
+    ascii_count = 0
+    cjk_count = 0
     for fpath in sorted(list(Path(work_dir).rglob("*.xhtml")) +
                          list(Path(work_dir).rglob("*.html"))):
         if any(p in ("extracted", "proofread_batches") for p in fpath.parts):
@@ -2175,12 +2573,14 @@ def _apply_glossary_to_xhtml(work_dir):
                 protected[placeholder] = m.group()
                 content = content.replace(m.group(), placeholder, 1)
 
-        # Replace within text content only (between > and <)
+        # Replace within text content only (between > and <).
+        # Single-pass regex prevents cascade when one term's translation
+        # contains another term.
         def _replace_text(m):
             t = m.group(1)
             orig_t = t
-            for en, cn in sorted(ascii_terms.items(), key=lambda x: -len(x[0])):
-                t = t.replace(en, cn)
+            if all_regex is not None:
+                t, _ = all_regex.subn(lambda m2: glossary[m2.group(0)], t)
             if t != orig_t:
                 t = re.sub(r" +", " ", t).strip()
             return ">" + t + "<"
@@ -2203,7 +2603,7 @@ def _apply_glossary_to_xhtml(work_dir):
             total += 1
 
     if total:
-        print(f"  Glossary->XHTML: {total} files updated with ASCII-term translations")
+        print(f"  Glossary->XHTML: {total} files updated ({len(glossary)} terms, ASCII+CJK)")
 def cmd_pack(args):
     """Repack EPUB from work directory. Output to project directory if available."""
     work_dir = Path(args.work_dir)
@@ -2293,6 +2693,37 @@ def _find_english_terms(extracted_dir, min_freq=3, top_n=30):
         but not at on is she from as be by we all so were they or this
         have been are no could would did said has one out if its who
         an do up their can them more when what about into
+        him there will us then your like some eyes too thought than over
+        know face before only knew head back made just now still even
+        after where how which our these those such each other through
+        between against without within during above below down again
+        further once here when while although because since until unless
+        however therefore thus hence also both either neither nor yet
+        very really quite rather much many few little own same different
+        new old first last long great right high low next early young
+        large small big good bad true false open close hand way day
+        man woman child time year people life world come go see look
+        take make give think feel want need seem become leave put mean
+        keep let begin show hear play run move live believe hold bring
+        happen write sit stand lose pay meet include continue set learn
+        change lead understand watch follow stop create speak read spend
+        grow walk win offer remember love consider appear buy wait serve
+        die send expect build stay fall cut reach kill remain suggest
+        raise pass sell require report decide pull toward upon around
+        never always often sometimes already soon later perhaps maybe
+        well away back off ever almost every another any same own
+        should must might shall may been being having doing going
+        am are were been being have has had do does did will would
+        shall should may might must can could ought need dare used
+        this that these those my your his her its our their
+        who whom whose which what when where why how
+        me him her us them myself yourself himself herself itself
+        ourselves themselves
+        oh ah yes no well now then so
+        said asked replied answered called cried shouted whispered
+        told looked turned walked came went stood sat
+        something nothing everything anything someone anyone everyone
+        somewhere nowhere everywhere anywhere somehow
     """.split())
     import collections
     tokens = collections.Counter()
@@ -2321,7 +2752,26 @@ def _find_suspected_variants(extracted_dir, top_n=30):
     """
     import collections
     _MAX_GROUP_SIZE = 60
-    _PARTICLES = set("的了在是不会将曾要也都就又很再")
+    # Characters commonly used in Chinese transliterations of foreign names.
+    # If the last char of a token is NOT in this set, it's likely a verb/particle suffix.
+    _TRANSLITERATION_CHARS = set(
+        "尔斯特克德拉利里格瑟林恩安伊奥亚维瓦塔诺卡莱蒙布罗纳达马尼加萨巴波索雷弗兰贝哈吉库穆菲珀瑞泰沃温扎赫洛莫佩普鲁塞希修雅约朱丹凯迪艾"
+        "琳娜娅妮莉丝蕾黛珊桑瑰琪琦瑶翠芙芬芳蒂蓓薇"
+        "昆坦顿敦伦伯格曼森登堡茨兹"
+        "阿拜彼茨迦科柯勒梅奈涅帕皮齐日舍施韦沙"
+    )
+    # Tokens starting with these chars are common words, not names
+    _COMMON_STARTS = set("我你他她它们这那什谁如为但却而所被把让给向从到自凝因尽即便")
+    _SEMANTIC_SUFFIXES = set(
+        "人部战式武语大营边掠女各众衣骑寒入冰围军领阵族国城王后"
+        "者们级型号地里面上下前后左右内外中间"
+        "家兄弟姐妹子儿头手身心口眼脸士师公侯伯爵修卫"
+        "一二三四五六七八九十百千万"
+        "的地得了着过不只也就还却才又已正把被让给向从到"
+        "说道对和与教看想问答笑叫走来去出进回做是在有"
+        "我你他她它们这那什谁吗呢吧啊哦嗯么"
+        "低轻双以用鞠便躬摇发告诉知高长短好坏多少新旧快慢"
+    )
     _token_re = re.compile(r'[\u4e00-\u9fff]{2,4}')
     tokens = collections.Counter()
     for fpath in sorted(extracted_dir.glob("chapter_*_preprocessed.json")):
@@ -2331,8 +2781,11 @@ def _find_suspected_variants(extracted_dir, top_n=30):
             text = seg.get("content", "")
             for m in _token_re.finditer(text):
                 raw = m.group()
-                # Strip trailing particle if the remaining token is still ≥2 chars
-                if len(raw) >= 3 and raw[-1] in _PARTICLES:
+                # Skip tokens starting with common words (not names)
+                if raw[0] in _COMMON_STARTS:
+                    continue
+                # Strip trailing non-transliteration char (likely verb/particle)
+                if len(raw) >= 3 and raw[-1] not in _TRANSLITERATION_CHARS:
                     raw = raw[:-1]
                 if len(raw) >= 2:
                     tokens[raw] += 1
@@ -2374,10 +2827,19 @@ def _find_suspected_variants(extracted_dir, top_n=30):
                 if len(a) == len(b):
                     shared = sum(1 for k in range(len(a)) if a[k] == b[k])
                     if shared >= len(a) - 1:
+                        # Filter: semantic suffix in diff position
+                        diff_chars = [a[k] for k in range(len(a)) if a[k] != b[k]]
+                        diff_chars += [b[k] for k in range(len(b)) if a[k] != b[k]]
+                        if any(c in _SEMANTIC_SUFFIXES for c in diff_chars):
+                            continue
                         candidates.append((a, b))
                 elif len(a) >= 2 and len(b) >= 2:
                     # Different lengths: first 2 chars must match
                     if a[:2] == b[:2]:
+                        shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+                        extra = longer[len(shorter):]
+                        if any(c in _SEMANTIC_SUFFIXES for c in extra):
+                            continue
                         candidates.append((a, b))
 
     seen = set()
@@ -2389,6 +2851,9 @@ def _find_suspected_variants(extracted_dir, top_n=30):
             shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
             # Filter: exclude proper-prefix pairs with ≤1 char suffix
             if longer.startswith(shorter) and len(longer) - len(shorter) <= 1:
+                continue
+            # Filter: both tokens must appear ≥3 times independently
+            if freq2.get(a, 0) < 3 or freq2.get(b, 0) < 3:
                 continue
             shared = sum(1 for k in range(min(len(a), len(b))) if a[k] == b[k])
             max_len = max(len(a), len(b))
@@ -2422,6 +2887,137 @@ def _find_suspected_variants(extracted_dir, top_n=30):
     return [(a, b, f) for a, b, f, *_ in top[:top_n]]
 
 
+def _generate_voice_cards(work_dir):
+    """Extract character dialogue samples for round 2 voice consistency check.
+
+    Scans corrected (or preprocessed) text for dialogue attributed to named
+    speakers, groups by character, and writes representative samples to
+    voice_cards.md. The LLM uses these in round 2 to verify each character
+    speaks with a consistent voice across all batches.
+    """
+    work_dir = Path(work_dir)
+    extracted_dir = work_dir / "extracted"
+    glossary = load_glossary(str(work_dir))
+
+    # Collect all text, preferring corrected over preprocessed
+    index_path = extracted_dir / "index.json"
+    if not index_path.exists():
+        return
+    index = json.load(open(index_path, "r", encoding="utf-8"))
+
+    all_text = ""
+    for item in index:
+        ch = item["chapter"]
+        corr = extracted_dir / f"chapter_{ch:04d}_corrected.json"
+        sentinel = extracted_dir / f"chapter_{ch:04d}.corrected"
+        pp = extracted_dir / f"chapter_{ch:04d}_preprocessed.json"
+        raw = extracted_dir / f"chapter_{ch:04d}.json"
+
+        if corr.exists() and sentinel.exists():
+            path = corr
+        elif pp.exists():
+            path = pp
+        else:
+            path = raw
+        if path.exists():
+            if all_text:
+                all_text += "\n---\n"
+            data = json.load(open(path, "r", encoding="utf-8"))
+            for s in data.get("segments", []):
+                all_text += s.get("content", "")
+
+    # Find dialogue with speaker attribution.
+    # Patterns: "NAME说", "NAME道", "NAME问", "NAME喊", "NAME回答",
+    # "NAME开口", "NAME低语", "NAME轻声说", etc.
+    speaker_pattern = re.compile(
+        r'([\u4e00-\u9fff·]{2,6})(?:轻声|低声|小声|冷冷|淡淡|缓缓|轻轻|'
+        r'微微|慢慢|忽然|突然|不禁|不由得|笑着|哭着|怒|叹|'
+        r'说道|回答|开口|低语|告诉|问道|喊道|叫道|'
+        r'说|道|问|喊|叫|答)'
+    )
+    quote_pattern = re.compile(r'[「「]([^」」]+)[」」]|"([^"]+)"|\u201c([^\u201d]+)\u201d')
+
+    # Collect dialogue by speaker
+    speakers = {}  # name -> [(dialogue_text, context_snippet)]
+    pos = 0
+    while pos < len(all_text):
+        m = speaker_pattern.search(all_text, pos)
+        if not m:
+            break
+        speaker = m.group(1)
+        pos = m.end()
+
+        # Look for quote after the attribution (within 50 chars)
+        window = all_text[pos:pos + 50]
+        qm = quote_pattern.search(window)
+        if qm:
+            dialogue = qm.group(1) or qm.group(2) or qm.group(3) or ""
+            if len(dialogue) > 4:
+                ctx = all_text[max(0, m.start() - 20):pos + qm.end() + 20]
+                if speaker not in speakers:
+                    speakers[speaker] = []
+                speakers[speaker].append((dialogue, ctx))
+                pos = pos + qm.end()
+        else:
+            pos = max(pos - len(speaker), m.start() + 1)
+
+    # Filter: only keep speakers whose name appears in the glossary
+    # (real character names) OR who have 15+ dialogue instances.
+    # This removes false positives like "不知道"/"我也是" that happen
+    # to match the speaker attribution regex but aren't actual characters.
+    known_names = set(glossary.keys()) | set(glossary.values())
+    major = {}
+    for name, samples in speakers.items():
+        if len(samples) < 3:
+            continue
+        if name in known_names:
+            major[name] = samples
+        elif len(samples) >= 15:
+            major[name] = samples  # very frequent, likely real but unknown
+
+    if not major:
+        return
+
+    # Pick 3-5 diverse samples per character (short/medium/long)
+    out_path = work_dir / "voice_cards.md"
+    lines = [
+        "## 角色声调卡",
+        "",
+        "以下为第 1 轮校对后从全文中提取的主要角色对话样本。",
+        "第 2 轮精修时，每次读到该角色的对话，**对照声调卡验证**：",
+        "- 说话风格是否一致（文雅/粗鄙/简洁/啰嗦）",
+        "- 语气是否与该角色身份、性格匹配",
+        '- 同一个人是否在不同 batch 里"换了声音"',
+        "",
+    ]
+    for name, samples in sorted(major.items(), key=lambda x: -len(x[1])):
+        # Pick diverse samples
+        sorted_samples = sorted(samples, key=lambda x: len(x[0]))
+        picks = [sorted_samples[0]]  # shortest
+        if len(sorted_samples) > 1:
+            picks.append(sorted_samples[-1])  # longest
+        if len(sorted_samples) > 2:
+            mid = sorted_samples[len(sorted_samples) // 2]
+            if mid not in picks:
+                picks.append(mid)
+        if len(sorted_samples) > 4:
+            picks.append(sorted_samples[len(sorted_samples) // 4])
+
+        lines.append(f"### {name}（{len(samples)} 处对话）")
+        lines.append("")
+        for i, (dialogue, ctx) in enumerate(picks[:5]):
+            lines.append(f"**样本 {i + 1}**：")
+            lines.append(f"> {dialogue}")
+            lines.append(f"上下文：…{ctx}…")
+            lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"  Voice cards: {len(major)} characters → {out_path.relative_to(work_dir.parent)}")
+
+
 def _auto_generate_corrections(work_dir):
     """Generate corrections_auto.json with mechanical fixes.
 
@@ -2434,6 +3030,10 @@ def _auto_generate_corrections(work_dir):
     config = load_config(work_dir)
     blacklist = config.get("blacklist", [])
 
+    # Patterns for mechanical fixes
+    _dup_re = re.compile(r'([\u4e00-\u9fff]{2,4})\1')
+    _tn_re = re.compile(r'[（(]注[：:][^）)]{1,300}[）)]')
+
     corrections = []
     for fpath in sorted(extracted_dir.glob("chapter_*_preprocessed.json")):
         with open(fpath, "r", encoding="utf-8") as f:
@@ -2443,24 +3043,24 @@ def _auto_generate_corrections(work_dir):
         for i, s in enumerate(segs):
             c = s.get("content", "")
             sid, sub = s["id"], s.get("sub_id", 0)
+            nc = c
 
-            # Blacklist replacement (use default neutral alternatives)
-            _BL_DEFAULT = {
-                "京城": "都城", "颤抖": "战栗", "眸子": "眼眸",
-                "不禁": "不由", "不由得": "不由", "心头一颤": "心中一颤",
-                "嗤笑": "低笑", "倾城": "绝色", "目光如炬": "目光锐利", "绝美": "极美",
-            }
+            # Fix 1: Duplicate CJK blocks ("海海辛瑟" → "海辛瑟")
+            # Only matches 2-4 char block repeats, not single-char reduplication ("哈哈")
+            nc = _dup_re.sub(r'\1', nc)
+
+            # Fix 2: Translator notes ("（注：...）" → delete)
+            nc_after_tn = _tn_re.sub('', nc)
+            if nc_after_tn != nc:
+                nc = nc_after_tn.strip() if nc_after_tn.strip() else " "
+
+            # Fix 3: Blacklist default replacements
+            bl_defaults = config.get("blacklist_defaults", {})
             if s.get("blacklisted"):
-                nc = c
                 for h in s.get("blacklist_hits", []):
-                    nc = nc.replace(h, _BL_DEFAULT.get(h, h))
-                if nc != c:
-                    corrections.append({
-                        "chapter": ch, "segment_id": f"{sid}.{sub}",
-                        "corrected": nc
-                    })
+                    nc = nc.replace(h, bl_defaults.get(h, h))
 
-            # English with nearby Chinese → auto-delete
+            # Fix 4: English with nearby Chinese → auto-delete
             if s.get("is_english"):
                 has_cn = False
                 for j in range(max(0, i - 5), min(len(segs), i + 6)):
@@ -2474,19 +3074,22 @@ def _auto_generate_corrections(work_dir):
                         has_cn = True
                         break
                 if has_cn:
-                    corrections.append({
-                        "chapter": ch, "segment_id": f"{sid}.{sub}",
-                        "corrected": " "
-                    })
+                    nc = " "
+
+            if nc != c:
+                corrections.append({
+                    "chapter": ch, "segment_id": f"{sid}.{sub}",
+                    "corrected": nc
+                })
 
     out_path = work_dir / "corrections_auto.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"glossary_additions": [], "corrections": corrections},
                   f, ensure_ascii=False, indent=2)
     # Count
-    blk_cnt = sum(1 for c in corrections if c["corrected"] in (" ", ""))
-    print(f"  Auto-corrections: {len(corrections)} ({blk_cnt} English deletions, "
-          f"{len(corrections) - blk_cnt} blacklist replacements)")
+    del_cnt = sum(1 for c in corrections if c["corrected"] in (" ", ""))
+    print(f"  Auto-corrections: {len(corrections)} ({del_cnt} deletions, "
+          f"{len(corrections) - del_cnt} blacklist/dup/note replacements)")
     print(f"  Saved to: {out_path.relative_to(work_dir.parent)}")
 
 
@@ -2507,8 +3110,20 @@ def _write_task_md(work_dir):
         "",
         "你现在是一个中文出版级校对员。校对分两轮进行。",
         "",
-        "**深度阅读要求：不要只扫描标记。仔细阅读每一段文本，**",
-        "**发现以下所有问题，不要遗漏：**",
+        "### 强制执行规则",
+        "",
+        "**以下规则不可跳过、不可缩短、不可「快速扫描」：**",
+        "",
+        "1. **每个 batch 必须完整、逐段深入阅读。** 覆盖该 batch 的全部内容，",
+        "   不可只读开头几段或抽样。无论 batch 大小，必须读完。",
+        "2. **认真审读每一段文本。** 不要只扫描 `[? ...]` 标记。许多术语",
+        "   变体和翻译腔不会自动标记，需要人工逐段发现。",
+        "3. **禁止跳过 batch。** 全书所有 batch 都必须逐个处理，不得以",
+        "   「术语已经够多」为由跳过后面的 batch。",
+        "4. **每个 batch 处理完必须立即 apply-corrections。** 后面的 batch",
+        "   可能发现前面遗漏的术语变体；apply 时 reprocess 会自动把新术语",
+        "   传播到全量章节（包括已校对过的章节的 `_corrected.json`）。",
+        "5. **阅读时注意以下所有问题，不要遗漏：**",
         "- 同一个外文人名/地名/神名的不同中文翻译（如「德拉奈」/「德洛内」应为统一的「德劳内」）",
         "- 未翻译的英文单词（如 anguissette 应为「痛苦者」）",
         "- `[? 需替换网文词: xxx]` 标记 → 替换为中性表达",
@@ -2517,7 +3132,7 @@ def _write_task_md(work_dir):
         "- AI 套话（'在上一章中'、'综上所述'等）、翻译腔、风格突变",
         "",
         "### 第 1 轮 — 术语发现 + 黑名单",
-        "逐 batch 处理，重点搜集**同指异译**的人名/地名/神名，写入 glossary_additions。",
+        "逐 batch 深度阅读，重点搜集**同指异译**的人名/地名/神名，写入 glossary_additions。",
         "每 batch 的 apply-corrections 会自动 reprocess，把新术语传播到全量章节。",
         "",
         "### 第 2 轮 — 英文处理 + 精修",
@@ -2557,9 +3172,11 @@ def _write_task_md(work_dir):
     if variants:
         lines.extend([
             "",
-            "### 疑似术语变体（仅供参考，你来判定是否统一）",
+            "### 疑似术语变体（请逐对确认）",
             "",
-            "以下词对在全书出现≥3次、同首字、同长度、仅差1字，可能是同指异译：",
+            "以下词对经算法筛选，可能是同一外文名的不同中译。**第 1 轮阅读时逐对确认**：",
+            "- 确认是同一专名的不同译法 → 写入 glossary_additions",
+            '- 是不同概念（如"斯卡迪人"和"斯卡迪语"）→ 跳过',
             "",
         ])
         for a, b, freq in variants[:30]:
@@ -2590,16 +3207,23 @@ def _write_task_md(work_dir):
         "",
         "### 第 2 轮：英文处理 + 精修",
         "",
-        "第 1 轮全部 batch apply 完毕后，从第 1 个 batch 重新开始：",
+        "第 1 轮全部 batch apply 完毕后，**先读取 `voice_cards.md`**（记录了主要角色的对话样本），",
+        "然后从第 1 个 batch 重新开始：",
         "",
         "a) 读取 batch 文件（此时 `[? 需替换网文词: xxx]` 应已消失，术语应已统一）",
         "b) 处理英文标记：",
-        "   - `[? 英文段落]` → 旁有中文译文，**删除英文段**（corrected 设为空格）",
+        "   - `[? 英文段落]` → pipeline 已自动删除，**跳过，无需处理**",
         "   - `[? 英文段落·待翻译]` → 无中文译文，**翻译为中文并写入 corrections**",
         "c) 修正 AI 套话、翻译腔、风格突变",
-        "d) 输出 corrections（本轮通常无 glossary_additions）",
-        f"e) 运行 `python proofread.py apply-corrections {work_dir} corrections.json`",
-        "f) 继续下一个 batch",
+        "d) **角色声调一致性**：读到角色对话时，对照 `voice_cards.md` 验证",
+        "   - 该角色的说话风格是否与声调卡中一致？",
+        "   - 是否有同一个角色在不同 batch 里「换了声音」？",
+        "e) **边界平滑检查**：每个 batch 开头有 `[BOUNDARY CHECK]` 标记",
+        "   - 对比标记前后 3 段的语气、节奏、用词",
+        "   - 若上一 batch 结尾和本 batch 开头风格不衔接 → 写入 corrections",
+        "f) 输出 corrections（本轮通常无 glossary_additions）",
+        f"g) 运行 `python proofread.py apply-corrections {work_dir} corrections.json`",
+        "h) 继续下一个 batch",
         "",
     ])
     if has_batches:
@@ -2625,13 +3249,21 @@ def _write_task_md(work_dir):
         "",
         "- `segment_id` 用 `[cN.sM]` 或 `[cN.sM.K]` 坐标，写整数不要写 3.0",
         "- `[? 需替换网文词: xxx]` — **必须替换**为中性表达",
-        "- `[? 英文段落]` — 英文段旁有中文译文→**删除英文**（保留中文）",
+        "- `[? 英文段落]` — pipeline 已自动删除，无需处理",
         "- `[? 英文段落·待翻译]` — 英文段无中文配对→**翻译为中文**",
         "- **全中文化**：所有外文单词（含虚构术语如 anguissette/vrajna）必须翻译为中文，写入 glossary_additions",
         "- 术语统一只针对**同一外文名不同中译**，不把简称替换成全名",
         "- 引号内对话不改变原意，只修正错别字和语病",
         "- 删除 AI 套话（\"在上一章中\"\"综上所述\"等过渡性废话）",
         "- 相邻段落风格突变须平滑衔接，保留原文换段和标点风格",
+        "- **概念同义词统一**：同指异名不限于专有名词。检查是否有不同词指同一概念",
+        "  （如\"圣殿骑士\"↔\"圣堂武士\"、\"法师\"↔\"魔法师\"、\"王国\"↔\"帝国\"），",
+        "  确认后写入 glossary_additions",
+        "- **代词一致性**：同一角色代词不应漂移。如果某角色在 batch A 为\"他\"、",
+        "  batch B 为\"她\"，必有一处错误，需回查原文修正",
+        "- **角色声音一致性**：同一角色的对话风格应在全书一致。如果一个角色在",
+        "  batch A 说话文雅、batch B 说话粗鄙，可能是 AI 分块翻译的拼接痕迹，",
+        "  须调整为统一口吻",
         "",
         "### 全部完成后：检查 + 注入 + 打包",
         "",
@@ -2643,6 +3275,26 @@ def _write_task_md(work_dir):
         "pack 完成后告知用户输出 EPUB 路径。**不要删 work 目录**。",
         "如需检查修订细节（会剧透）：",
         f"- `python proofread.py check --diff-log diff.txt {work_dir}`",
+        "",
+        "### 全部完成后：输出无剧透统计报告",
+        "",
+        "pack 完成后，必须自动输出一份校对统计报告。",
+        "报告只含数字和类别名称，**严禁包含任何剧情内容、角色命运、具体段落文本**。",
+        "格式示例：",
+        "",
+        "```",
+        "## 校对完成报告",
+        "",
+        "| 项目 | 数值 |",
+        "|------|------|",
+        "| 术语总条数 | xxx |",
+        "| 黑名单词替换 | xxx 手动 + xxx 自动 |",
+        "| 英文段落删除 | xxx |",
+        "| 英文段落翻译 | xx |",
+        "| 总修改段数 | xxx |",
+        "",
+        "输出：{path}/output.epub",
+        "```",
     ])
 
     task_path = work_dir / "TASK.md"
@@ -2700,7 +3352,12 @@ def cmd_pipeline(args):
 
     # Step 4: Dump text + generate task for Claude (fully automated)
     print("\n[4/5] Dumping text + generating task file...")
-    dump_args = argparse.Namespace(work_dir=str(work_dir), max_chars=100000)
+    max_chars = getattr(args, 'max_chars', 0) or 100000  # --max-chars flag or default
+    # Persist max_chars in config so _redump_batches uses the same value
+    config = load_config(work_dir)
+    config.setdefault("proofreading", {})["max_chars"] = max_chars
+    save_config(config, work_dir)
+    dump_args = argparse.Namespace(work_dir=str(work_dir), max_chars=max_chars)
     ret = cmd_dump_text(dump_args)
     if ret:
         return ret
@@ -2710,6 +3367,20 @@ def cmd_pipeline(args):
 
     # Auto-generate corrections file with mechanical fixes
     _auto_generate_corrections(work_dir)
+
+    # Auto-apply mechanical fixes (blacklist words + English deletions)
+    # so the user doesn't need to remember to do it manually.
+    auto_corr_path = work_dir / "corrections_auto.json"
+    if auto_corr_path.exists():
+        print("\n[5/5] Auto-applying mechanical fixes...")
+        fake_args = argparse.Namespace(work_dir=str(work_dir), corrections_json=str(auto_corr_path))
+        ret = cmd_apply_corrections(fake_args)
+        if ret:
+            print("  Warning: Some auto-corrections could not be applied.")
+        print()
+
+    # Generate character voice cards for round 2 consistency checks
+    _generate_voice_cards(work_dir)
 
     print("\n" + "=" * 60)
     print("READY. 下一步：对 Claude 说「读取 TASK.md 并按指示操作」")
@@ -2770,6 +3441,9 @@ def main():
                         help="Blacklist profile (fantasy|romance|general|minimal)")
     p_pipe.add_argument("--blacklist-file", help="Path to custom blacklist (.txt or .json)")
     p_pipe.add_argument("--work-dir", help="Work directory (default: auto-generated)")
+    p_pipe.add_argument("--max-chars", type=int, default=0,
+                        help="Auto-split into batches if total exceeds N chars. "
+                             "Use 50000 for small-context models, 200000 for 1M+ models.")
 
     p_addterm = sub.add_parser("add-term", help="Add/update a term in glossary")
     p_addterm.add_argument("work_dir", help="Work directory containing glossary.json")
@@ -2831,7 +3505,7 @@ def main():
         except json.JSONDecodeError as e:
             print(f"  Error: invalid JSON: {e}")
             return 1
-        added, updated, unchanged = add_terms_batch(terms_list, args.work_dir)
+        added, updated, unchanged, _ = add_terms_batch(terms_list, args.work_dir)
         print(f"  Batch add: {added} added, {updated} updated, {unchanged} unchanged")
         return 0
     elif args.command == "check":
