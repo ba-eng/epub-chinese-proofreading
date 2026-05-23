@@ -22,6 +22,8 @@ from proofread import (
     proofread_text,
     _three_way_merge,
     _auto_generate_corrections,
+    _validate_glossary_entry,
+    _count_glossary_residual,
 )
 
 
@@ -358,6 +360,77 @@ def test_4_whitespace_fallback():
     return passed, total
 
 
+def test_5_advisory_blacklist_and_glossary_guards():
+    """Advisory blacklist stays soft; unsafe glossary entries are rejected."""
+    print("=== Test 5: Advisory blacklist + glossary guards ===")
+    passed = 0
+    total = 0
+
+    processed, blacklisted, hits, advisory_hits = proofread_text(
+        "他不禁看见美眸。", {}, ["美眸"], {"left": True}, ["不禁"]
+    )
+
+    total += 1
+    if blacklisted and hits == ["美眸"]:
+        print("  5a: Hard blacklist still flags: OK")
+        passed += 1
+    else:
+        print(f"  5a: Hard blacklist still flags: FAIL ({blacklisted=}, {hits=})")
+
+    total += 1
+    if advisory_hits == ["不禁"]:
+        print("  5b: Advisory blacklist reported separately: OK")
+        passed += 1
+    else:
+        print(f"  5b: Advisory blacklist reported separately: FAIL ({advisory_hits=})")
+
+    total += 1
+    soft = proofread_text("他不禁停下。", {}, [], {"left": True}, ["不禁"])
+    if soft[1] is False and soft[2] == [] and soft[3] == ["不禁"]:
+        print("  5c: Advisory-only hit is not hard failure: OK")
+        passed += 1
+    else:
+        print(f"  5c: Advisory-only hit is not hard failure: FAIL ({soft=})")
+
+    total += 1
+    if _validate_glossary_entry("他", "她"):
+        print("  5d: Single-character CJK glossary key rejected: OK")
+        passed += 1
+    else:
+        print("  5d: Single-character CJK glossary key rejected: FAIL")
+
+    total += 1
+    if _validate_glossary_entry("向", "方向"):
+        print("  5e: High-risk function-word glossary key rejected: OK")
+        passed += 1
+    else:
+        print("  5e: High-risk function-word glossary key rejected: FAIL")
+
+    total += 1
+    if _validate_glossary_entry("艾格勒莫", "艾格勒莫特特"):
+        print("  5f: Doubled-CJK glossary target rejected: OK")
+        passed += 1
+    else:
+        print("  5f: Doubled-CJK glossary target rejected: FAIL")
+
+    total += 1
+    if _count_glossary_residual("艾格勒莫特来到这里。", "艾格勒莫", "艾格勒莫特") == 0:
+        print("  5g: Residual scan ignores source inside target: OK")
+        passed += 1
+    else:
+        print("  5g: Residual scan ignores source inside target: FAIL")
+
+    total += 1
+    if _count_glossary_residual("艾格勒莫来到艾格勒莫特。", "艾格勒莫", "艾格勒莫特") == 1:
+        print("  5h: Residual scan still counts standalone source: OK")
+        passed += 1
+    else:
+        print("  5h: Residual scan still counts standalone source: FAIL")
+
+    print(f"  [{passed}/{total} passed]\n")
+    return passed, total
+
+
 def main():
     print("=" * 60)
     print("TARGETED FIX REGRESSION TESTS")
@@ -372,6 +445,7 @@ def main():
         test_2_english_literary_guard,
         test_3_merge_guards,
         test_4_whitespace_fallback,
+        test_5_advisory_blacklist_and_glossary_guards,
     ]:
         p, t = test_fn()
         all_passed += p

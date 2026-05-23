@@ -48,6 +48,10 @@ task = Path(wdir) / "TASK.md"
 ft = Path(wdir) / "full_text.txt"
 assert task.exists(), "TASK.md missing"
 assert ft.exists(), "full_text.txt missing"
+with open(Path(wdir) / "context.json", encoding="utf-8") as f:
+    ctx = json.load(f)
+assert Path(ctx["project_dir"]) == Path(wdir).parent.resolve(), "explicit --work-dir project_dir should be work_dir parent"
+print(f"  project_dir: {ctx['project_dir']}")
 print(f"  TASK.md: {len(task.read_text(encoding='utf-8'))} chars")
 print(f"  full_text.txt: {len(ft.read_text(encoding='utf-8'))} chars")
 
@@ -114,6 +118,7 @@ epubs = list(Path(wdir).rglob("*.epub"))
 if not epubs:
     epubs = list(Path(wdir).parent.glob("*.epub"))
 assert epubs, "No output EPUB"
+assert Path(wdir).parent / "output.epub" in epubs, "pack output should use explicit --work-dir parent"
 with zipfile.ZipFile(str(epubs[0])) as zf:
     names = zf.namelist()
     assert "mimetype" in names, "Invalid EPUB"

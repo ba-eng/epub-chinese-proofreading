@@ -62,7 +62,7 @@ BLACKLIST_PROFILES = ["fantasy", "romance", "general", "minimal"]
 
 
 def _extract_blacklist_words(data):
-    """Extract word list from a blacklist JSON structure.
+    """Extract hard blacklist words from a blacklist JSON structure.
 
     Handles both {"words": [...]} / {"blacklist": [...]} dicts and
     plain [...] arrays (list input that would otherwise crash on .get()).
@@ -72,42 +72,42 @@ def _extract_blacklist_words(data):
     return data.get("words", data.get("blacklist", []))
 
 
-def load_blacklist(profile="fantasy", custom_file=None):
-    """Load blacklist words from a named profile or custom text file.
+def _extract_blacklist_advisory(data):
+    """Extract soft advisory blacklist words from a blacklist JSON structure."""
+    if isinstance(data, list):
+        return []
+    return data.get("advisory", data.get("blacklist_advisory", []))
 
-    Args:
-        profile: One of 'fantasy', 'romance', 'general', 'minimal'
-        custom_file: Optional path to a .txt file (one word per line) or .json file
 
-    Returns:
-        list of blacklist words
-    """
-    # Custom file takes priority
+def load_blacklist_terms(profile="fantasy", custom_file=None):
+    """Load hard and advisory blacklist words from profile/config."""
     if custom_file and os.path.exists(custom_file):
         fp = Path(custom_file)
         if fp.suffix == ".json":
             with open(fp, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
-                return _extract_blacklist_words(data)
-        else:
-            # Text file: one word per line
-            with open(fp, "r", encoding="utf-8-sig") as f:
-                return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+            return _extract_blacklist_words(data), _extract_blacklist_advisory(data)
+        with open(fp, "r", encoding="utf-8-sig") as f:
+            return [line.strip() for line in f if line.strip() and not line.startswith("#")], []
 
-    # Load from profile
     profile_path = BLACKLIST_DIR / f"{profile}.json"
     if profile_path.exists():
         with open(profile_path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
-            return _extract_blacklist_words(data)
+        return _extract_blacklist_words(data), _extract_blacklist_advisory(data)
 
-    # Ultimate fallback: default config
     if DEFAULT_CONFIG_PATH.exists():
         with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
-            return _extract_blacklist_words(data)
+        return _extract_blacklist_words(data), _extract_blacklist_advisory(data)
 
-    return []
+    return [], []
+
+
+def load_blacklist(profile="fantasy", custom_file=None):
+    """Load hard blacklist words from a named profile or custom file."""
+    return load_blacklist_terms(profile, custom_file)[0]
+
 
 # ---------------------------------------------------------------------------
 # XML parsing helpers (lxml with fallback to ElementTree)
@@ -437,7 +437,7 @@ def _build_glossary_regex(glossary):
     return re.compile(pattern)
 
 
-def proofread_text(text, glossary, blacklist, quote_state=None):
+def proofread_text(text, glossary, blacklist, quote_state=None, advisory_blacklist=None):
     """Apply proofreading phases A & B mechanically.
 
     Phase A: Glossary replacement — regex-based, longest-term-first.
@@ -448,9 +448,8 @@ def proofread_text(text, glossary, blacklist, quote_state=None):
 
     Phase B: Blacklist FLAGGING (NOT skipping).
       Blacklist = undesirable网文 clichés that need to be replaced.
-      Segments containing blacklist words are STILL PROOFREAD.
-      The blacklist words are flagged for Claude to replace/rewrite
-      during phase C with context-appropriate neutral alternatives.
+      Advisory blacklist = context-dependent words that should be reviewed
+      but do not count as hard violations or trigger auto-correction.
 
     Args:
         text: Original text string
@@ -458,12 +457,12 @@ def proofread_text(text, glossary, blacklist, quote_state=None):
         blacklist: list of网文词汇 needing treatment
         quote_state: Optional dict {"left": bool} to persist quote parity
                      across segments split by inline tags. Reset per chapter.
+        advisory_blacklist: Optional list of context-dependent words to flag softly.
 
     Returns:
-        (processed, has_blacklist, blacklist_matches)
-        - processed: glossary-replaced text
-        - has_blacklist: True if blacklist words found (FLAG, not SKIP)
-        - blacklist_matches: list of matching blacklist words
+        (processed, has_blacklist, blacklist_matches) by default.
+        If advisory_blacklist is provided, returns
+        (processed, has_blacklist, blacklist_matches, advisory_matches).
     """
     # Phase A: Glossary replacement — skip English-heavy segments.
     # Short CJK glossary terms (e.g. "他"→"他") would match inside
@@ -510,10 +509,10 @@ def proofread_text(text, glossary, blacklist, quote_state=None):
 
     # Phase B: Blacklist FLAGGING — mark for treatment, don't skip
     hits = [w for w in blacklist if w in processed]
-    if hits:
-        return (processed, True, hits)
-
-    return (processed, False, [])
+    advisory_hits = [w for w in (advisory_blacklist or []) if w in processed]
+    if advisory_blacklist is not None:
+        return (processed, bool(hits), hits, advisory_hits)
+    return (processed, bool(hits), hits)
 
 
 # Module-level cache for glossary regex (built once per preprocess run)
@@ -600,6 +599,9 @@ def _dump_chapter_lines(chapter, data):
         if seg.get("blacklisted") and seg.get("blacklist_hits"):
             bl_words = ", ".join(seg["blacklist_hits"])
             body.append(f"[? 需替换网文词: {bl_words}]")
+        if seg.get("advisory_hits"):
+            adv_words = ", ".join(seg["advisory_hits"])
+            body.append(f"[? 建议审视用词: {adv_words}]")
         if seg.get("is_english"):
             # Check if nearby Chinese translation exists (bilingual → delete EN)
             all_segs = data.get("segments", [])
@@ -1103,6 +1105,37 @@ def compute_change_ratio(original, proofread_text):
     return 1.0 - SequenceMatcher(None, original, proofread_text).ratio()
 
 
+def _has_doubled_cjk(text):
+    """Return True if text contains consecutive repeated CJK chars."""
+    return bool(re.search(r'([\u4e00-\u9fff])\1', text))
+
+
+_HIGH_RISK_CJK_TERMS = set(
+    "我你他她它们这那什谁的地得了着过不只也就还却才又已正把被让给向从到"
+)
+
+
+def _validate_glossary_entry(term, translation):
+    """Return None when safe, otherwise a rejection reason."""
+    if not term or not translation:
+        return "empty term or translation"
+    if re.fullmatch(r'[\u4e00-\u9fff]', term):
+        return "single-character CJK key is unsafe"
+    if term in _HIGH_RISK_CJK_TERMS:
+        return "high-risk function-word key is unsafe"
+    if _has_doubled_cjk(translation):
+        return "target has doubled CJK characters"
+    return None
+
+
+def _count_glossary_residual(html_text, term, target):
+    """Count source term residuals, ignoring occurrences inside canonical target."""
+    scan_text = html_text
+    if target and target != term:
+        scan_text = scan_text.replace(target, "")
+    return scan_text.count(term)
+
+
 def add_term_to_glossary(term, translation, work_dir):
     """Add a new term→translation pair to the glossary.
 
@@ -1116,14 +1149,10 @@ def add_term_to_glossary(term, translation, work_dir):
     """
     glossary = load_glossary(work_dir)
 
-    # Validate: warn about targets with doubled CJK characters.
-    # These are usually LLM output errors (e.g. 野野蕾薇院) but can
-    # occasionally be legitimate (transliterated names like 迪迪埃).
-    doubled = re.findall(r'([\u4e00-\u9fff])\1', translation)
-    if doubled:
-        unique = set(doubled)
-        print(f"  WARNING: target '{translation}' has doubled CJK chars: {', '.join(c*2 for c in unique)}")
-        print(f"  This is often an LLM output error — please verify the canonical form is correct.")
+    reason = _validate_glossary_entry(term, translation)
+    if reason:
+        print(f"  WARNING: rejected glossary entry {term} -> {translation}: {reason}")
+        return False
 
     if term in glossary:
         if glossary[term] == translation:
@@ -1252,14 +1281,9 @@ def add_terms_batch(terms_list, work_dir):
         if not term or not trans:
             continue
 
-        # Validate: warn about targets with doubled CJK characters.
-        # These are usually LLM output errors (e.g. 野野蕾薇院) but can
-        # occasionally be legitimate (transliterated names like 迪迪埃).
-        doubled = re.findall(r'([\u4e00-\u9fff])\1', trans)
-        if doubled:
-            unique = set(doubled)
-            print(f"  WARNING: glossary_additions target '{trans}' has doubled CJK: {', '.join(c*2 for c in unique)}")
-            print(f"  This is often an LLM output error — please verify the canonical form is correct.")
+        reason = _validate_glossary_entry(term, trans)
+        if reason:
+            print(f"  WARNING: rejected glossary_additions entry {term} -> {trans}: {reason}")
             rejected += 1
             continue
 
@@ -1422,14 +1446,16 @@ def cmd_init(args):
     # Novel name from EPUB filename (without .epub extension)
     novel_name = input_path.stem
 
-    # Project directory: proofread/{novel_name}/ — persistent across sessions.
-    # All books share a single `proofread/` workspace under the Claude Code root.
-    # Use --work-dir to override with a custom path.
-    project_dir = Path.cwd() / "proofread" / novel_name
+    # Project directory: proofread/{novel_name}/ by default, or the explicit
+    # work directory's parent when --work-dir is supplied.
+    if args.work_dir:
+        work_dir = Path(args.work_dir)
+        project_dir = work_dir.parent
+    else:
+        project_dir = Path.cwd() / "proofread" / novel_name
+        work_dir = project_dir / "work"
     project_dir.mkdir(parents=True, exist_ok=True)
 
-    # Work directory: tmp (inside project_dir or as specified)
-    work_dir = Path(args.work_dir) if args.work_dir else project_dir / "work"
     if work_dir.exists():
         # Safety guard: refuse to delete directories that don't look like
         # our work dir (prevents accidental data loss from --work-dir typos).
@@ -1466,12 +1492,15 @@ def cmd_init(args):
             print("  Empty glossary")
 
     # --- Blacklist ---
-    blacklist = load_blacklist(profile=getattr(args, 'profile', 'fantasy'),
-                               custom_file=getattr(args, 'blacklist_file', None))
-    print(f"  Blacklist: {len(blacklist)} words (profile={getattr(args, 'profile', 'fantasy')})")
+    blacklist, advisory_blacklist = load_blacklist_terms(
+        profile=getattr(args, 'profile', 'fantasy'),
+        custom_file=getattr(args, 'blacklist_file', None)
+    )
+    print(f"  Blacklist: {len(blacklist)} hard + {len(advisory_blacklist)} advisory words "
+          f"(profile={getattr(args, 'profile', 'fantasy')})")
 
     # --- Config ---
-    build_config(work_dir, project_dir, blacklist, args)
+    build_config(work_dir, project_dir, blacklist, advisory_blacklist, args)
 
     # Save context for later commands
     context = {
@@ -1487,7 +1516,7 @@ def cmd_init(args):
     return 0
 
 
-def build_config(work_dir, project_dir, blacklist, args):
+def build_config(work_dir, project_dir, blacklist, advisory_blacklist, args):
     """Build merged config: default → shipped overrides → project overrides → --config flag."""
     config = {}
     # Layer 1: default
@@ -1508,6 +1537,7 @@ def build_config(work_dir, project_dir, blacklist, args):
 
     # Always override blacklist with the one we loaded
     config["blacklist"] = blacklist
+    config["blacklist_advisory"] = advisory_blacklist
 
     save_config(config, work_dir)
 
@@ -1526,8 +1556,10 @@ def build_config(work_dir, project_dir, blacklist, args):
         with open(project_config, "r", encoding="utf-8") as f:
             existing = json.load(f)
             project_config_out["blacklist"] = existing.get("blacklist", blacklist)
+            project_config_out["blacklist_advisory"] = existing.get("blacklist_advisory", advisory_blacklist)
     else:
         project_config_out["blacklist"] = blacklist
+        project_config_out["blacklist_advisory"] = advisory_blacklist
     save_config(project_config_out, project_dir)
 
 
@@ -1630,6 +1662,7 @@ def cmd_preprocess(args):
     _rebuild_glossary_regex(glossary)
     config = load_config(work_dir)
     blacklist = config.get("blacklist", [])
+    advisory_blacklist = config.get("blacklist_advisory", config.get("advisory", []))
     threshold = config.get("proofreading", {}).get("long_text_threshold", 300)
     split_punc = config.get("proofreading", {}).get("split_punctuation", ["。", "？", "！"])
 
@@ -1651,8 +1684,8 @@ def cmd_preprocess(args):
         quote_state = {"left": True}  # persist quote parity across segments
         for seg in chapter_data.get("segments", []):
             original = seg.get("content", "")
-            processed, blacklisted, bl_hits = proofread_text(
-                original, glossary, blacklist, quote_state
+            processed, blacklisted, bl_hits, advisory_hits = proofread_text(
+                original, glossary, blacklist, quote_state, advisory_blacklist
             )
             if blacklisted:
                 total_blacklisted += 1
@@ -1688,6 +1721,7 @@ def cmd_preprocess(args):
                     "content": sentence,
                     "blacklisted": blacklisted,
                     "blacklist_hits": bl_hits,
+                    "advisory_hits": advisory_hits,
                     "is_english": is_english,
                 })
 
@@ -1863,6 +1897,7 @@ def cmd_reprocess(args):
     _rebuild_glossary_regex(glossary)
     config = load_config(work_dir)
     blacklist = config.get("blacklist", [])
+    advisory_blacklist = config.get("blacklist_advisory", config.get("advisory", []))
     threshold = config.get("proofreading", {}).get("long_text_threshold", 300)
     split_punc = config.get("proofreading", {}).get("split_punctuation", ["。", "？", "！"])
 
@@ -1897,7 +1932,9 @@ def cmd_reprocess(args):
         quote_state = {"left": True}  # persist quote parity across segments
         for seg in chapter_data.get("segments", []):
             original = seg.get("content", "")
-            processed, blacklisted, bl_hits = proofread_text(original, glossary, blacklist, quote_state)
+            processed, blacklisted, bl_hits, advisory_hits = proofread_text(
+                original, glossary, blacklist, quote_state, advisory_blacklist
+            )
             if blacklisted:
                 total_blacklisted += 1
             processed = apply_mechanical_style_fixes(processed)
@@ -1928,6 +1965,7 @@ def cmd_reprocess(args):
                     "content": sentence,
                     "blacklisted": blacklisted,
                     "blacklist_hits": bl_hits,
+                    "advisory_hits": advisory_hits,
                     "is_english": is_english,
                 })
 
@@ -2327,7 +2365,7 @@ def cmd_check(args):
                     continue
                 if any(c.isascii() and c.isalpha() for c in term):
                     continue
-                count = html_text.count(term)
+                count = _count_glossary_residual(html_text, term, target)
                 if count > 0:
                     residual.append((term, target, count))
 
@@ -3089,6 +3127,23 @@ def _find_suspected_variants(extracted_dir, top_n=30):
                     raw = raw[:-1]
                 if len(raw) >= 2:
                     tokens[raw] += 1
+
+    def _collapse_boundary_noise(token_counts):
+        boundary_chars = set(
+            "来向给对把让看望问答说去回走将与和及并着了的地得在是有为以用"
+            "再微常亲打太颔耸沉闻似挑举站补深预嫣竟凝背扬琳盛年"
+        )
+        collapsed = collections.Counter(token_counts)
+        for tok, count in list(token_counts.items()):
+            if len(tok) < 3:
+                continue
+            base = tok[:-1]
+            if base in token_counts and tok[-1] in boundary_chars:
+                collapsed[base] += count
+                del collapsed[tok]
+        return collapsed
+
+    tokens = _collapse_boundary_noise(tokens)
 
     # Keep tokens appearing ≥2 times, plus singletons sharing 2-char prefix
     freq2 = {t: c for t, c in tokens.items() if c >= 2}

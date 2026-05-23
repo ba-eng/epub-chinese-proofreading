@@ -61,6 +61,14 @@ VARIANTS = [
 ]
 
 
+# Boundary-noise tokens should be collapsed into their base token, not reported
+# as suspected variants. These model regex captures like “专名 + 下一动作字”.
+BOUNDARY_NOISE = [
+    ("梅莉桑德", "梅莉桑德再", 5, 3),
+    ("伊桑德尔", "伊桑德尔扬", 4, 2),
+]
+
+
 # These should not be reported just because some syllables overlap.
 FALSE_POSITIVE_GUARDS = [
     ("知道", "直到", 6, 6),
@@ -88,6 +96,9 @@ DISTRACTORS = [
 def build_corpus(tmpdir):
     items = []
     for a, b, ca, cb in VARIANTS + KNOWN_UNDETECTABLE:
+        items.extend([a] * ca)
+        items.extend([b] * cb)
+    for a, b, ca, cb in BOUNDARY_NOISE:
         items.extend([a] * ca)
         items.extend([b] * cb)
     for a, b, ca, cb in FALSE_POSITIVE_GUARDS:
@@ -145,6 +156,7 @@ def run_test():
         print(f"Actual production detections: {len(detected)}")
         print(f"Distractors: {len(DISTRACTORS)}")
         print(f"False-positive guard pairs: {len(FALSE_POSITIVE_GUARDS)}")
+        print(f"Boundary-noise guard pairs: {len(BOUNDARY_NOISE)}")
         print(f"Unique variant tokens: {(len(VARIANTS) + len(KNOWN_UNDETECTABLE)) * 2}")
 
         print(f"\n{'Metric':>20} {'Value':>12}")
