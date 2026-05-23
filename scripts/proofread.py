@@ -300,6 +300,32 @@ def _is_valid_term_char(c):
 # U+00B7 middle dot, U+30FB katakana middle dot, hyphen, space, bullet, hyphenation point
 
 
+def _is_english_heavy(text, check_run=True):
+    """Detect English/predominantly-ASCII text.
+
+    Light mode (check_run=False): simple alpha-ratio heuristic. Used for
+    protective guards (skip glossary/semicolon processing on likely-English text).
+
+    Full mode (check_run=True): adds long-ASCII-run detection + minimum alpha
+    threshold. Used for flagging segments as English content for LLM handling.
+    """
+    alpha = sum(1 for c in text if c.isalpha())
+    eng = sum(1 for c in text if c.isascii() and c.isalpha())
+    if not check_run:
+        return eng > 0 and eng / max(alpha, 1) > 0.5
+    max_ascii_run = 0
+    cur_run = 0
+    for c in text:
+        if c.isascii() and c.isalpha():
+            cur_run += 1
+            max_ascii_run = max(max_ascii_run, cur_run)
+        else:
+            cur_run = 0
+    return max_ascii_run >= 30 or (
+        alpha >= 20 and eng > 0 and eng / max(alpha, 1) > 0.5
+    )
+
+
 def _normalize_segment_id(val, keep_dot_zero=False):
     """Normalize LLM segment_id for dict key lookup.
 
@@ -471,9 +497,7 @@ def proofread_text(text, glossary, blacklist, quote_state=None, advisory_blackli
         # Guard: if text is predominantly ASCII alpha, skip glo.
         # Without this, short CJK glossary terms like "他" would match
         # inside English words ("he"→"他", corrupting "she"→"s他").
-        alpha = sum(1 for c in text if c.isalpha())
-        eng = sum(1 for c in text if c.isascii() and c.isalpha())
-        if eng > 0 and eng / max(alpha, 1) > 0.5:
+        if _is_english_heavy(text, check_run=False):
             processed = text  # skip glossary on English/predominantly-ASCII text
         else:
             processed, _ = _GLOSSARY_REGEX.subn(
@@ -485,9 +509,7 @@ def proofread_text(text, glossary, blacklist, quote_state=None, advisory_blackli
     # Phase A2: Semicolon replacement — Chinese fiction uses ； extremely rarely.
     # Most are English translation artifacts; replace with full-width comma.
     # Skip English/predominantly-ASCII text to avoid corrupting code/HTML.
-    alpha = sum(1 for c in processed if c.isalpha())
-    eng = sum(1 for c in processed if c.isascii() and c.isalpha())
-    if not (eng > 0 and eng / max(alpha, 1) > 0.5):
+    if not _is_english_heavy(processed, check_run=False):
         processed = processed.replace('\uff1b', '\uff0c')
 
     # Phase A3: ASCII straight quotes → Chinese curly quotes.
@@ -1378,6 +1400,8 @@ def save_glossary(glossary, work_dir):
                     if v not in glossary:
                         glossary[v] = v  # identity mapping
                         added += 1
+                    # break inner for-k-in-expandable loop; one identity
+                    # mapping per value is enough. Next outer v continues.
                     break
 
     path = Path(work_dir) / GLOSSARY_FILENAME
@@ -1693,21 +1717,7 @@ def cmd_preprocess(args):
             # marks words that Claude should replace during phase C
             processed = apply_mechanical_style_fixes(processed)
             # Flag English-heavy segments so ALL sub-segments get the marker
-            alpha = sum(1 for c in processed if c.isalpha())
-            eng = sum(1 for c in processed if c.isascii() and c.isalpha())
-            # Detect long ASCII runs (English sentences) within CJK text
-            max_ascii_run = 0
-            cur_run = 0
-            for c in processed:
-                if c.isascii() and c.isalpha():
-                    cur_run += 1
-                    max_ascii_run = max(max_ascii_run, cur_run)
-                else:
-                    cur_run = 0
-            has_english_run = max_ascii_run >= 30 or (
-                alpha >= 20 and eng > 0 and eng / max(alpha, 1) > 0.5
-            )
-            is_english = has_english_run
+            is_english = _is_english_heavy(processed)
             sentences = split_long_text(processed, threshold, split_punc)
             total_sentences += len(sentences)
 
@@ -1939,20 +1949,7 @@ def cmd_reprocess(args):
                 total_blacklisted += 1
             processed = apply_mechanical_style_fixes(processed)
             # Flag English-heavy segments (same logic as cmd_preprocess)
-            alpha = sum(1 for c in processed if c.isalpha())
-            eng = sum(1 for c in processed if c.isascii() and c.isalpha())
-            max_ascii_run = 0
-            cur_run = 0
-            for c in processed:
-                if c.isascii() and c.isalpha():
-                    cur_run += 1
-                    max_ascii_run = max(max_ascii_run, cur_run)
-                else:
-                    cur_run = 0
-            has_english_run = max_ascii_run >= 30 or (
-                alpha >= 20 and eng > 0 and eng / max(alpha, 1) > 0.5
-            )
-            is_english = has_english_run
+            is_english = _is_english_heavy(processed)
             sentences = split_long_text(processed, threshold, split_punc)
             total_sentences += len(sentences)
 
@@ -2061,15 +2058,15 @@ def cmd_reprocess(args):
 
 
 def cmd_check(args):
-    """Run mechanical checks on proofread output. With --fix, auto-revert violations.
+    """Run mechanical checks on proofread output. With --fix, auto-revert safe violations.
 
     Validates:
       1. Change ratio per segment (must be ≤ max_change_ratio)
-      2. No new blacklist words introduced
-      3. Blacklisted segments unchanged
+      2. Hard blacklist words have been replaced
+      3. Advisory blacklist words are informational only
 
-    With --fix: auto-reverts over-changed segments to conservative version
-    (mechanical style fixes only).
+    With --fix: auto-reverts over-changed mechanical/preprocessed segments
+    to a conservative version. LLM-corrected segments are never overwritten.
     """
     work_dir = Path(args.work_dir)
     extracted_dir = work_dir / "extracted"
@@ -3578,7 +3575,7 @@ def _auto_generate_corrections(work_dir):
                     if default != h:
                         escaped = re.escape(h)
                         nc = re.sub(
-                            r'(?<![一-鿿])' + escaped + r'(?![一-鿿])',
+                            r'(?<![\u3400-\u4dbf\u4e00-\u9fff])' + escaped + r'(?![\u3400-\u4dbf\u4e00-\u9fff])',
                             default, nc
                         )
 
@@ -3681,19 +3678,7 @@ def _cleanup_residual_english(work_dir):
                 continue
 
             # Still English? Re-run the same detection as cmd_preprocess
-            alpha = sum(1 for c in corr_content if c.isalpha())
-            eng = sum(1 for c in corr_content if c.isascii() and c.isalpha())
-            max_ascii_run = 0
-            cur_run = 0
-            for c in corr_content:
-                if c.isascii() and c.isalpha():
-                    cur_run += 1
-                    max_ascii_run = max(max_ascii_run, cur_run)
-                else:
-                    cur_run = 0
-            still_english = max_ascii_run >= 30 or (
-                alpha >= 20 and eng > 0 and eng / max(alpha, 1) > 0.5
-            )
+            still_english = _is_english_heavy(corr_content)
             if not still_english:
                 continue
 
