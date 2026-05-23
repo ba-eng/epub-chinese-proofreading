@@ -11,7 +11,7 @@ from proofread import (
     extract_text_segments, _decode_xhtml, split_long_text,
     apply_mechanical_style_fixes, compute_change_ratio,
     natural_sort_key, _is_cjk, _is_valid_term_char, _ENTITY_REVERSE_MAP,
-    _safe_extract_epub, _read_xhtml_text, cmd_apply_corrections,
+    _safe_extract_epub, _read_xhtml_text,
 )
 
 passed = failed = 0

@@ -45,11 +45,11 @@ python .claude/skills/epub-chinese-proofreading/scripts/proofread.py pipeline in
 # 3. 应用校对结果（每个 batch 后都运行一次）
 python .claude/skills/epub-chinese-proofreading/scripts/proofread.py apply-corrections work/ corrections.json
 
-# 4. 检查、注入、打包、术语覆盖验证
+# 4. 检查、注入、术语覆盖验证、打包
 python .claude/skills/epub-chinese-proofreading/scripts/proofread.py check --diff work/
 python .claude/skills/epub-chinese-proofreading/scripts/proofread.py inject work/
-python .claude/skills/epub-chinese-proofreading/scripts/proofread.py pack work/ output.epub
 python .claude/skills/epub-chinese-proofreading/scripts/proofread.py check --glossary work/
+python .claude/skills/epub-chinese-proofreading/scripts/proofread.py pack work/ output.epub
 ```
 
 保留 `work/`，便于检查 diff 或进行后续轮次。

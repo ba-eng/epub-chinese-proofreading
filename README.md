@@ -35,7 +35,7 @@ Claude 自动完成全部流程：
 | pipeline | Python | 解包→提取→机械预处理→分卷→术语变体预扫描→英文术语检测→自动修正→生成 TASK.md |
 | 第1轮校对 | LLM | 逐 batch 深度阅读，搜集术语变体，处理黑名单标记 |
 | 第2轮校对 | LLM | 逐 batch 精修：英文处理、翻译腔消除、AI套话、风格统一 |
-| 检查+注入+打包 | Python | check --diff→inject→pack→check --glossary → 输出统计报告 |
+| 检查+注入+打包 | Python | check --diff→inject→check --glossary→pack → 输出统计报告 |
 | 第3轮润色 | LLM | 翻译腔深化、欧化句拆分、标点规范、角色声音增强、朗读节奏（**用户确认后执行**） |
 
 全程无剧透（终端只显示计数），最终输出 `output.epub`。
@@ -66,8 +66,8 @@ python scripts/proofread.py apply-corrections ./work/ corrections.json
 # 步骤 4：检查 + 注入 + 打包
 python scripts/proofread.py check --diff ./work/
 python scripts/proofread.py inject ./work/
-python scripts/proofread.py pack ./work/
 python scripts/proofread.py check --glossary ./work/
+python scripts/proofread.py pack ./work/
 ```
 
 > 不传 `--work-dir` 时，默认工作目录是 `proofread/{EPUB文件名}/work/`。
@@ -92,7 +92,7 @@ python scripts/proofread.py check --diff-log diff.txt ./work/
 | `dump-text ./work/ [--max-chars N]` | 导出全书（自动分卷） |
 | `apply-corrections ./work/ corrections.json` | 应用 LLM 校对（自动 reprocess） |
 | `check --diff ./work/` | 检查改动量（无剧透） |
-| `check --glossary ./work/` | pack 后验证术语覆盖率 + glossary 自检 |
+| `check --glossary ./work/` | 注入后验证术语覆盖率 + glossary 自检 |
 | `check --diff-log diff.txt ./work/` | 逐句对比（带剧透警告） |
 | `extract-terms ./work/` | 自动提取术语映射 |
 | `add-term ./work/ "原词" "替换词"` | 手动添加术语 |
