@@ -3100,6 +3100,11 @@ def _find_suspected_variants(extracted_dir, top_n=30):
     for t, c in tokens.items():
         if t in freq2 or len(t) < 2:
             continue
+        if t[-1] in _SEMANTIC_SUFFIXES and t[-1] not in _TRANSLITERATION_CHARS:
+            continue
+        hits = sum(1 for ch in t if ch in _TRANSLITERATION_CHARS)
+        if hits < max(2, math.ceil(len(t) * 0.6)):
+            continue
         if t[:2] in prefix_idx:
             freq2[t] = 2  # rescued singleton; use 2 to clear the ≥2 threshold
 
@@ -3160,14 +3165,14 @@ def _find_suspected_variants(extracted_dir, top_n=30):
                 g = suffix_groups[t[1:]]
                 if len(g) < _MAX_SUFFIX_GROUP:
                     g.append(t)
-        for suffix, tokens in suffix_groups.items():
-            if len(tokens) < 2:
+        for suffix, suffix_tokens in suffix_groups.items():
+            if len(suffix_tokens) < 2:
                 continue
             # Only compare tokens with different first chars
-            for i in range(len(tokens)):
-                a = tokens[i]
-                for j in range(i + 1, len(tokens)):
-                    b = tokens[j]
+            for i in range(len(suffix_tokens)):
+                a = suffix_tokens[i]
+                for j in range(i + 1, len(suffix_tokens)):
+                    b = suffix_tokens[j]
                     if a[0] == b[0]:
                         continue  # already compared in within-group pass
                     # Same length guaranteed (same suffix + both len>=3)
@@ -3247,6 +3252,8 @@ def _find_suspected_variants(extracted_dir, top_n=30):
 
     pinyin_by_first = collections.defaultdict(list)
     for token in freq2:
+        if tokens[token] < 2:
+            continue
         if not _is_translit_like(token):
             continue
         syllables = _pinyin_syllables(token)
