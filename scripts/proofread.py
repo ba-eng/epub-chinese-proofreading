@@ -476,7 +476,7 @@ def proofread_text(text, glossary, blacklist):
             processed = text  # skip glossary on English/predominantly-ASCII text
         else:
             processed, _ = _GLOSSARY_REGEX.subn(
-                lambda m: glossary[m.group(0)], text
+                lambda m: glossary.get(m.group(0), m.group(0)), text
             )
     else:
         processed = text
@@ -1251,6 +1251,7 @@ def add_terms_batch(terms_list, work_dir):
             print(f"  WARNING: glossary_additions target '{trans}' has doubled CJK: {', '.join(c*2 for c in unique)}")
             print(f"  This is often an LLM output error — please verify the canonical form is correct.")
             rejected += 1
+            continue
 
         # Resolve chains: if trans is itself a key, follow to final value
         original_trans = trans
@@ -2788,7 +2789,7 @@ def _apply_glossary_to_xhtml(work_dir):
             t = m.group(1)
             orig_t = t
             if all_regex is not None:
-                t, _ = all_regex.subn(lambda m2: glossary[m2.group(0)], t)
+                t, _ = all_regex.subn(lambda m2: glossary.get(m2.group(0), m2.group(0)), t)
             if t != orig_t:
                 t = re.sub(r" +", " ", t).strip()
             return ">" + t + "<"
@@ -2971,6 +2972,7 @@ def _find_suspected_variants(extracted_dir, top_n=30):
         "琳娜娅妮莉丝蕾黛珊桑瑰琪琦瑶翠芙芬芳蒂蓓薇"
         "昆坦顿敦伦伯格曼森登堡茨兹"
         "阿拜彼茨迦科柯勒梅奈涅帕皮齐日舍施韦沙"
+        "耶撒门以兰夫吉麦丹耳列威尼黎但士来百内冰"
     )
     # Tokens starting with these chars are common words, not names
     _COMMON_STARTS = set("我你他她它们这那什谁如为但却而所被把让给向从到自凝因尽即便")
@@ -3013,7 +3015,7 @@ def _find_suspected_variants(extracted_dir, top_n=30):
         if t in freq2 or len(t) < 2:
             continue
         if t[:2] in prefix_idx:
-            freq2[t] = 1  # rescued singleton
+            freq2[t] = 2  # rescued singleton; use 2 to clear the ≥2 threshold
 
     if len(freq2) < 2:
         return []
@@ -3042,7 +3044,7 @@ def _find_suspected_variants(extracted_dir, top_n=30):
                         # Filter: semantic suffix in diff position
                         diff_chars = [a[k] for k in range(len(a)) if a[k] != b[k]]
                         diff_chars += [b[k] for k in range(len(b)) if a[k] != b[k]]
-                        if any(c in _SEMANTIC_SUFFIXES for c in diff_chars):
+                        if any(c in _SEMANTIC_SUFFIXES and c not in _TRANSLITERATION_CHARS for c in diff_chars):
                             continue
                         candidates.append((a, b))
                 elif len(a) >= 2 and len(b) >= 2:
@@ -3050,9 +3052,38 @@ def _find_suspected_variants(extracted_dir, top_n=30):
                     if a[:2] == b[:2]:
                         shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
                         extra = longer[len(shorter):]
-                        if any(c in _SEMANTIC_SUFFIXES for c in extra):
+                        if any(c in _SEMANTIC_SUFFIXES and c not in _TRANSLITERATION_CHARS for c in extra):
                             continue
                         candidates.append((a, b))
+
+    # Cross-group comparison: detect variants with different first chars
+    # but matching suffixes (e.g., 约书亚/耶苏亚 share "书亚").
+    # Group same-length tokens by suffix (chars[1:]), compare across groups.
+    _MAX_SUFFIX_GROUP = 40
+    if len(freq2) >= 2:
+        suffix_groups = collections.defaultdict(list)
+        for t in freq2:
+            if len(t) >= 3:
+                g = suffix_groups[t[1:]]
+                if len(g) < _MAX_SUFFIX_GROUP:
+                    g.append(t)
+        for suffix, tokens in suffix_groups.items():
+            if len(tokens) < 2:
+                continue
+            # Only compare tokens with different first chars
+            for i in range(len(tokens)):
+                a = tokens[i]
+                for j in range(i + 1, len(tokens)):
+                    b = tokens[j]
+                    if a[0] == b[0]:
+                        continue  # already compared in within-group pass
+                    # Same length guaranteed (same suffix + both len>=3)
+                    # Diff chars are positions 0 for both (their first chars)
+                    diff_chars = [a[0], b[0]]
+                    if any(c in _SEMANTIC_SUFFIXES and c not in _TRANSLITERATION_CHARS for c in diff_chars):
+                        continue
+                    # shared = len-1 (all suffix chars match)
+                    candidates.append((a, b))
 
     seen = set()
     result = []
@@ -3060,12 +3091,13 @@ def _find_suspected_variants(extracted_dir, top_n=30):
         key = tuple(sorted([a, b]))
         if key not in seen:
             seen.add(key)
-            shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-            # Filter: exclude proper-prefix pairs with ≤1 char suffix
-            if longer.startswith(shorter) and len(longer) - len(shorter) <= 1:
-                continue
-            # Filter: both tokens must appear ≥3 times independently
-            if freq2.get(a, 0) < 3 or freq2.get(b, 0) < 3:
+            # Frequency threshold: both tokens must appear ≥2 times.
+            # Lowered from 3 to 2 to catch rare variants (e.g., a name
+            # translated correctly 95% of the time but slipped 2-3 times).
+            # (Former proper-prefix filter removed — it blocked genuine
+            # name-suffix variants. The semantic suffix filter in the
+            # candidate-formation loop already handles common suffixes.)
+            if freq2.get(a, 0) < 2 or freq2.get(b, 0) < 2:
                 continue
             shared = sum(1 for k in range(min(len(a), len(b))) if a[k] == b[k])
             max_len = max(len(a), len(b))
@@ -3184,8 +3216,8 @@ def _generate_voice_cards(work_dir):
             continue
         if name in known_names:
             major[name] = samples
-        elif len(samples) >= 15:
-            major[name] = samples  # very frequent, likely real but unknown
+        elif len(samples) >= 8:
+            major[name] = samples  # frequent enough, likely real character
 
     if not major:
         return
@@ -3205,19 +3237,28 @@ def _generate_voice_cards(work_dir):
     for name, samples in sorted(major.items(), key=lambda x: -len(x[1])):
         # Pick diverse samples
         sorted_samples = sorted(samples, key=lambda x: len(x[0]))
-        picks = [sorted_samples[0]]  # shortest
+        # Pick 5-7 diverse samples: shortest, longest, and 3 quartile points
+        picks = [sorted_samples[0]]
         if len(sorted_samples) > 1:
-            picks.append(sorted_samples[-1])  # longest
-        if len(sorted_samples) > 2:
-            mid = sorted_samples[len(sorted_samples) // 2]
-            if mid not in picks:
-                picks.append(mid)
-        if len(sorted_samples) > 4:
-            picks.append(sorted_samples[len(sorted_samples) // 4])
+            picks.append(sorted_samples[-1])
+        n = len(sorted_samples)
+        for frac in (n // 4, n // 2, 3 * n // 4):
+            if 0 < frac < n - 1:
+                candidate = sorted_samples[frac]
+                if candidate not in picks:
+                    picks.append(candidate)
+        # Fill remaining slots from middle if available
+        if len(picks) < 5 and len(sorted_samples) > len(picks):
+            step = max(1, len(sorted_samples) // 6)
+            for i in range(step, len(sorted_samples) - 1, step):
+                if len(picks) >= 7:
+                    break
+                if sorted_samples[i] not in picks:
+                    picks.append(sorted_samples[i])
 
         lines.append(f"### {name}（{len(samples)} 处对话）")
         lines.append("")
-        for i, (dialogue, ctx) in enumerate(picks[:5]):
+        for i, (dialogue, ctx) in enumerate(picks[:7]):
             lines.append(f"**样本 {i + 1}**：")
             lines.append(f"> {dialogue}")
             lines.append(f"上下文：…{ctx}…")
@@ -3243,7 +3284,11 @@ def _auto_generate_corrections(work_dir):
     blacklist = config.get("blacklist", [])
 
     # Patterns for mechanical fixes
-    _dup_re = re.compile(r'([\u4e00-\u9fff]{2,4})\1')
+    # Fix 1: Block-level CJK duplication (e.g. "海辛瑟海辛瑟" → "海辛瑟").
+    # Uses {3,4} (not {2,4}) to avoid matching legitimate ABAB verb
+    # reduplication like "考虑考虑"/"商量商量" (2-char reduplication is
+    # standard Chinese grammar, not a translation artifact).
+    _dup_re = re.compile(r'([\u4e00-\u9fff]{3,4})\1')
     _tn_re = re.compile(r'[（(]注[：:][^）)]{1,300}[）)]')
 
     corrections = []
@@ -3266,11 +3311,20 @@ def _auto_generate_corrections(work_dir):
             if nc_after_tn != nc:
                 nc = nc_after_tn.strip() if nc_after_tn.strip() else " "
 
-            # Fix 3: Blacklist default replacements
+            # Fix 3: Blacklist default replacements.
+            # Use CJK boundary regex (same as preprocessor) to avoid corrupting
+            # legitimate words that contain the blacklist term as substring
+            # (e.g. "情不自禁" must not become "情不由禁").
             bl_defaults = config.get("blacklist_defaults", {})
             if s.get("blacklisted"):
                 for h in s.get("blacklist_hits", []):
-                    nc = nc.replace(h, bl_defaults.get(h, h))
+                    default = bl_defaults.get(h, h)
+                    if default != h:
+                        escaped = re.escape(h)
+                        nc = re.sub(
+                            r'(?<![一-鿿])' + escaped + r'(?![一-鿿])',
+                            default, nc
+                        )
 
             # Fix 4: English with nearby Chinese → auto-delete
             if s.get("is_english"):
@@ -3342,9 +3396,12 @@ def _write_task_md(work_dir):
         "- `[? 英文段落]` → 旁有中文译文则删除英文段",
         "- `[? 英文段落·待翻译]` → 翻译为中文",
         "- AI 套话（'在上一章中'、'综上所述'等）、翻译腔、风格突变",
+        "- **翻译完整性**：对话引导句（「他说，笑着」）是否遗漏了状态修饰（漏了「笑着」），常见省略如笑着说、叹了口气、低声、冷冷地等",
+        "- **格言/重复句式统一**：全书中反复出现的格言、座右铭、仪式用语必须在所有出现处逐字一致。处理每个 batch 时注意是否有前文出现过的固定短语在本 batch 以不同措辞出现",
         "",
         "### 第 1 轮 — 术语发现 + 黑名单",
         "逐 batch 深度阅读，重点搜集**同指异译**的人名/地名/神名，写入 glossary_additions。",
+        "同时注意全书中反复出现的**格言、座右铭、仪式用语**是否在所有出现处逐字一致。",
         "每 batch 的 apply-corrections 会自动 reprocess，把新术语传播到全量章节。",
         "",
         "### 第 2 轮 — 英文处理 + 精修",
@@ -3436,6 +3493,11 @@ def _write_task_md(work_dir):
         "   - 过于正式的代词 → 「该」→「这个/那」、「该事件」→「这件事」",
         "   - 被动语态过滥 → 「被/让人们/被人们」→ 主动语态或删除施动者",
         "   - 注：只改明显翻译腔，不确定的保留。不要强行改写正常中文",
+        "   - **翻译完整性检查**：对话/动作引导句中，检查中文是否遗漏了原文的状态修饰——",
+        "     「他说，笑着」不应只译「他说」（漏了「笑着」），「她叹了口气回答」不应只译「她回答」。",
+        "     常见易漏词：笑着说、叹了口气、低声、冷冷地、轻声、喃喃、眯起眼、点了点头等。",
+        "     对照上下文判断——如果引导句异常简短，且上下文也**没有**通过其他句子传达该情绪/动作，",
+        "     很可能是 AI 翻译时省略了引导句中的修饰，需要补回。如果上下文已传达了同样的信息则无需修改。",
         "d) **边界平滑检查**：每个 batch 开头有 `[BOUNDARY CHECK]` 标记",
         "   - 对比标记前后 3 段的语气、节奏、用词",
         "   - 若上一 batch 结尾和本 batch 开头风格不衔接 → 写入 corrections",
