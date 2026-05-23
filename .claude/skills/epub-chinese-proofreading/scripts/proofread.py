@@ -606,10 +606,10 @@ def _dump_chapter_lines(chapter, data):
                     if j == seg_idx:
                         continue
                     n = all_segs[j].get("content", "")
-                    na = sum(1 for c in n if c.isalpha())
-                    if na < 20:
+                    cj = sum(1 for c in n if '\u4e00' <= c <= '\u9fff')
+                    if cj < 20:
                         continue
-                    if sum(1 for c in n if c.isascii() and c.isalpha()) / na < 0.3:
+                    if sum(1 for c in n if c.isascii() and c.isalpha()) / max(cj, 1) < 0.2:
                         has_cn = True
                         break
             if has_cn:
@@ -1887,6 +1887,21 @@ def cmd_reprocess(args):
             if blacklisted:
                 total_blacklisted += 1
             processed = apply_mechanical_style_fixes(processed)
+            # Flag English-heavy segments (same logic as cmd_preprocess)
+            alpha = sum(1 for c in processed if c.isalpha())
+            eng = sum(1 for c in processed if c.isascii() and c.isalpha())
+            max_ascii_run = 0
+            cur_run = 0
+            for c in processed:
+                if c.isascii() and c.isalpha():
+                    cur_run += 1
+                    max_ascii_run = max(max_ascii_run, cur_run)
+                else:
+                    cur_run = 0
+            has_english_run = max_ascii_run >= 30 or (
+                alpha >= 20 and eng > 0 and eng / max(alpha, 1) > 0.5
+            )
+            is_english = has_english_run
             sentences = split_long_text(processed, threshold, split_punc)
             total_sentences += len(sentences)
 
@@ -1898,7 +1913,8 @@ def cmd_reprocess(args):
                     "original": original if j == 0 else "",
                     "content": sentence,
                     "blacklisted": blacklisted,
-                    "blacklist_hits": bl_hits
+                    "blacklist_hits": bl_hits,
+                    "is_english": is_english,
                 })
 
         out = {
@@ -2442,6 +2458,9 @@ def cmd_inject(args):
                 if restored:
                     print(f"  Restored {restored} XHTML files from source EPUB")
 
+    # --- Pre-inject safety net: catch English segments the LLM missed ---
+    _cleanup_residual_english(work_dir)
+
     index_path = extracted_dir / "index.json"
     if not index_path.exists():
         print("  No index.json found. Run extract first.")
@@ -2630,19 +2649,14 @@ def cmd_inject(args):
                     # decodes these to characters, but raw file bytes retain
                     # the entity form. Try hex-encoding all CJK chars.
                     if idx == -1:
-                        has_cjk = any('\u4e00' <= c <= '\u9fff' or
-                                      '\u3400' <= c <= '\u4dbf' or
-                                      '\uf900' <= c <= '\ufaff'
-                                      for c in orig)
+                        has_cjk = any(_is_cjk(c) for c in orig)
                         if has_cjk:
                             orig_cjk_hex = html.escape(orig)
                             cjk_buf = list(orig_cjk_hex)
                             i = 0
                             while i < len(cjk_buf):
                                 cp = ord(cjk_buf[i])
-                                if (0x4e00 <= cp <= 0x9fff or
-                                    0x3400 <= cp <= 0x4dbf or
-                                    0xf900 <= cp <= 0xfaff):
+                                if _is_cjk(cjk_buf[i]):
                                     cjk_buf[i] = f'&#x{cp:x};'
                                 i += 1
                             orig_cjk_hex = ''.join(cjk_buf)
@@ -2678,11 +2692,8 @@ def cmd_inject(args):
                         if entity_form == 'cjk_hex':
                             buf = list(repl_final)
                             for i in range(len(buf)):
-                                cp = ord(buf[i])
-                                if (0x4e00 <= cp <= 0x9fff or
-                                    0x3400 <= cp <= 0x4dbf or
-                                    0xf900 <= cp <= 0xfaff):
-                                    buf[i] = f'&#x{cp:x};'
+                                if _is_cjk(buf[i]):
+                                    buf[i] = f'&#x{ord(buf[i]):x};'
                             repl_final = ''.join(buf)
 
                         content = content[:idx] + repl_final + content[idx + len(orig):]
@@ -2807,8 +2818,30 @@ def _apply_glossary_to_xhtml(work_dir):
             enc = m.group(1) if m else "utf-8"
             # Atomic write to prevent truncated XHTML on crash
             tmp_path = Path(str(fpath) + ".tmp")
-            with open(tmp_path, "w", encoding=enc, errors="replace") as f:
-                f.write(content)
+            try:
+                with open(tmp_path, "w", encoding=enc) as f:
+                    f.write(content)
+            except UnicodeEncodeError:
+                # Glossary replacement may have introduced characters outside
+                # the original encoding's repertoire (e.g. CJK Extension chars
+                # in GBK). Fall back to UTF-8 and update encoding declarations.
+                content = re.sub(
+                    r'encoding\s*=\s*["\'][^"\']+["\']',
+                    'encoding="UTF-8"',
+                    content, count=1
+                )
+                content = re.sub(
+                    r'(<meta\s+charset\s*=\s*["\'])[^"\']+(["\'])',
+                    r'\1UTF-8\2',
+                    content, flags=re.IGNORECASE
+                )
+                content = re.sub(
+                    r'(<meta\s+[^>]*charset\s*=\s*)[^"\'\s;]+',
+                    r'\1UTF-8',
+                    content, flags=re.IGNORECASE
+                )
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(content)
             os.replace(tmp_path, fpath)
             total += 1
 
@@ -3177,7 +3210,7 @@ def _generate_voice_cards(work_dir):
         r'说道|回答|开口|低语|告诉|问道|喊道|叫道|'
         r'说|道|问|喊|叫|答)'
     )
-    quote_pattern = re.compile(r'[「「]([^」」]+)[」」]|"([^"]+)"|\u201c([^\u201d]+)\u201d')
+    quote_pattern = re.compile(r'[「『]([^」』]+)[」』]|"([^"]+)"|\u201c([^\u201d]+)\u201d')
 
     # Collect dialogue by speaker
     speakers = {}  # name -> [(dialogue_text, context_snippet)]
@@ -3331,10 +3364,10 @@ def _auto_generate_corrections(work_dir):
                     if j == i:
                         continue
                     n = segs[j].get("content", "")
-                    na = sum(1 for x in n if x.isalpha())
-                    if na < 20:
+                    cj = sum(1 for x in n if '\u4e00' <= x <= '\u9fff')
+                    if cj < 20:
                         continue
-                    if sum(1 for x in n if x.isascii() and x.isalpha()) / na < 0.3:
+                    if sum(1 for x in n if x.isascii() and x.isalpha()) / max(cj, 1) < 0.2:
                         has_cn = True
                         break
                 if has_cn:
@@ -3355,6 +3388,119 @@ def _auto_generate_corrections(work_dir):
     print(f"  Auto-corrections: {len(corrections)} ({del_cnt} deletions, "
           f"{len(corrections) - del_cnt} blacklist/dup/note replacements)")
     print(f"  Saved to: {out_path.relative_to(work_dir.parent)}")
+
+
+def _cleanup_residual_english(work_dir):
+    """Pre-inject safety net: remove English segments the LLM missed.
+
+    Scans _corrected.json for segments where is_english=True and content
+    matches _preprocessed.json (LLM never touched them). For those with
+    nearby Chinese translations: auto-delete. For those without: flag.
+
+    Returns (deleted, flagged) counts.
+    """
+    work_dir = Path(work_dir)
+    extracted_dir = work_dir / "extracted"
+    index_path = extracted_dir / "index.json"
+    if not index_path.exists():
+        return 0, 0
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        index = json.load(f)
+
+    missed_deleted = 0
+    missed_flagged = 0
+
+    for item in index:
+        ch = item["chapter"]
+        corr_path = extracted_dir / f"chapter_{ch:04d}_corrected.json"
+        sentinel = extracted_dir / f"chapter_{ch:04d}.corrected"
+        pp_path = extracted_dir / f"chapter_{ch:04d}_preprocessed.json"
+
+        if not corr_path.exists() or not sentinel.exists():
+            continue
+        if not pp_path.exists():
+            continue
+
+        with open(corr_path, "r", encoding="utf-8") as f:
+            corr_data = json.load(f)
+        with open(pp_path, "r", encoding="utf-8") as f:
+            pp_data = json.load(f)
+
+        pp_by_key = {}
+        for s in pp_data.get("segments", []):
+            key = (s["id"], s.get("sub_id", 0))
+            pp_by_key[key] = s
+
+        segs = corr_data.get("segments", [])
+        modified = False
+
+        for i, s in enumerate(segs):
+            if not s.get("is_english"):
+                continue
+            key = (s["id"], s.get("sub_id", 0))
+            pp_seg = pp_by_key.get(key)
+            if not pp_seg:
+                continue
+
+            corr_content = s.get("content", "")
+            pp_content = pp_seg.get("content", "")
+
+            # LLM touched this segment → skip
+            if corr_content != pp_content:
+                continue
+
+            # Still English? Re-run the same detection as cmd_preprocess
+            alpha = sum(1 for c in corr_content if c.isalpha())
+            eng = sum(1 for c in corr_content if c.isascii() and c.isalpha())
+            max_ascii_run = 0
+            cur_run = 0
+            for c in corr_content:
+                if c.isascii() and c.isalpha():
+                    cur_run += 1
+                    max_ascii_run = max(max_ascii_run, cur_run)
+                else:
+                    cur_run = 0
+            still_english = max_ascii_run >= 30 or (
+                alpha >= 20 and eng > 0 and eng / max(alpha, 1) > 0.5
+            )
+            if not still_english:
+                continue
+
+            # LLM missed this English segment. Check for CN neighbors.
+            has_cn = False
+            for j in range(max(0, i - 5), min(len(segs), i + 6)):
+                if j == i:
+                    continue
+                n = segs[j].get("content", "")
+                cj = sum(1 for x in n if '\u4e00' <= x <= '\u9fff')
+                if cj < 20:
+                    continue
+                if sum(1 for x in n if x.isascii() and x.isalpha()) / max(cj, 1) < 0.2:
+                    has_cn = True
+                    break
+
+            if has_cn:
+                s["content"] = " "
+                missed_deleted += 1
+                modified = True
+            else:
+                missed_flagged += 1
+
+        if modified:
+            tmp_path = extracted_dir / f"chapter_{ch:04d}_corrected.json.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(corr_data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, corr_path)
+
+    if missed_deleted:
+        print(f"  Residual EN cleanup: {missed_deleted} missed English segments "
+              f"auto-deleted (CN pair found)")
+    if missed_flagged:
+        print(f"  ⚠ {missed_flagged} English segments untranslated "
+              f"(no CN pair) — may appear in EPUB")
+
+    return missed_deleted, missed_flagged
 
 
 def _write_task_md(work_dir):
