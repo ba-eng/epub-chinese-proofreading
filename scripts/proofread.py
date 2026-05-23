@@ -14,7 +14,7 @@ Commands:
 """
 
 import argparse
-import difflib
+import hashlib
 import html
 import json
 import math
@@ -1039,8 +1039,6 @@ def cmd_apply_corrections(args):
 
             for corr in corrs:
                 raw_sid = corr.get("segment_id", "")
-                # When data has sub-segments, keep "N.0" as "N.0" to match
-                # individual sub-segment key (not the merged _parts entry).
                 sid = _normalize_segment_id(raw_sid, keep_dot_zero=has_subs)
                 corrected = corr.get("corrected")
                 # Empty string is a valid correction (deletion of segment content).
@@ -1049,15 +1047,13 @@ def cmd_apply_corrections(args):
                 if sid in seg_map and corrected is not None:
                     target = seg_map[sid]
                     if "_parts" in target:
-                        parts = target["_parts"]
-                        if parts:
-                            parts[0]["content"] = corrected
-                            for p in parts[1:]:
-                                p["content"] = ""
-                        applied += 1
-                    else:
-                        target["content"] = corrected
-                        applied += 1
+                        print(
+                            f"  Warning: skipping ambiguous segment_id {raw_sid!r} "
+                            f"in chapter {ch}; use sub-segment id like {sid}.0"
+                        )
+                        continue
+                    target["content"] = corrected
+                    applied += 1
 
             out_path = extracted_dir / f"chapter_{ch:04d}_corrected.json"
             sentinel_path = extracted_dir / f"chapter_{ch:04d}.corrected"
@@ -1460,6 +1456,15 @@ def _read_xhtml_text(filepath):
         return _decode_xhtml(f.read())
 
 
+def _file_sha256(filepath):
+    """Return SHA-256 hex digest for a file."""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Core commands
 # ---------------------------------------------------------------------------
@@ -1540,7 +1545,8 @@ def cmd_init(args):
     context = {
         "project_dir": str(project_dir.resolve()),
         "novel_name": novel_name,
-        "input_epub": str(input_path)
+        "input_epub": str(input_path),
+        "input_epub_sha256": _file_sha256(input_path)
     }
     with open(work_dir / "context.json", "w", encoding="utf-8") as f:
         json.dump(context, f, ensure_ascii=False, indent=2)
@@ -2519,6 +2525,11 @@ def cmd_inject(args):
             ctx = json.load(f)
         input_epub = ctx.get("input_epub")
         if input_epub and os.path.exists(input_epub):
+            expected_sha = ctx.get("input_epub_sha256")
+            if expected_sha and _file_sha256(input_epub) != expected_sha:
+                print(f"  Error: source EPUB changed since pipeline: {input_epub}")
+                print("  Re-run pipeline for the new source EPUB, or restore the original file.")
+                return 1
             import zipfile as _zipfile
             with _zipfile.ZipFile(input_epub) as _zf:
                 restored = 0
@@ -3914,7 +3925,7 @@ def _write_task_md(work_dir):
         "",
         "### 规则",
         "",
-        "- `segment_id` 用 `[cN.sM]` 或 `[cN.sM.K]` 坐标，写整数不要写 3.0",
+        "- `segment_id` 用 `[cN.sM]` 或 `[cN.sM.K]` 坐标。`[cN.sM]` 写整数 `M`；`[cN.sM.K]` 必须写完整的 `M.K`（如 `3.0`），不要省略子段号",
         "- `[? 需替换网文词: xxx]` — **必须替换**为中性表达",
         "- `[? 英文段落]` — pipeline 已自动删除，无需处理",
         "- `[? 英文段落·待翻译]` — 英文段无中文配对→**翻译为中文**",
@@ -3937,9 +3948,10 @@ def _write_task_md(work_dir):
         f"1. `python proofread.py check --diff {work_dir}`",
         f"2. `python proofread.py inject {work_dir}`",
         f"3. `python proofread.py pack {work_dir}`",
+        f"4. `python proofread.py check --glossary {work_dir}`",
         "",
         "check 的非零退出通常是英文删除的 change ratio 虚高，diff 报告的修改段数吻合即可继续。",
-        "pack 完成后告知用户输出 EPUB 路径。**不要删 work 目录**。",
+        "pack 完成后运行 check --glossary 验证最终 EPUB 工作目录中的术语覆盖，再告知用户输出 EPUB 路径。**不要删 work 目录**。",
         "如需检查修订细节（会剧透）：",
         f"- `python proofread.py check --diff-log diff.txt {work_dir}`",
         "",
