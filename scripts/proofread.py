@@ -531,6 +531,7 @@ def proofread_text(text, glossary, blacklist, quote_state=None, advisory_blackli
 
     # Phase B: Blacklist FLAGGING — mark for treatment, don't skip
     hits = [w for w in blacklist if w in processed]
+    processed = apply_mechanical_style_fixes(processed)
     advisory_hits = [w for w in (advisory_blacklist or []) if w in processed]
     if advisory_blacklist is not None:
         return (processed, bool(hits), hits, advisory_hits)
