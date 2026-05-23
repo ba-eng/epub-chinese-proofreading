@@ -437,7 +437,7 @@ def _build_glossary_regex(glossary):
     return re.compile(pattern)
 
 
-def proofread_text(text, glossary, blacklist):
+def proofread_text(text, glossary, blacklist, quote_state=None):
     """Apply proofreading phases A & B mechanically.
 
     Phase A: Glossary replacement — regex-based, longest-term-first.
@@ -456,6 +456,8 @@ def proofread_text(text, glossary, blacklist):
         text: Original text string
         glossary: dict of {original_term: unified_translation}
         blacklist: list of网文词汇 needing treatment
+        quote_state: Optional dict {"left": bool} to persist quote parity
+                     across segments split by inline tags. Reset per chapter.
 
     Returns:
         (processed, has_blacklist, blacklist_matches)
@@ -491,13 +493,17 @@ def proofread_text(text, glossary, blacklist):
 
     # Phase A3: ASCII straight quotes → Chinese curly quotes.
     # Alternating state machine: first " becomes \u201c, next becomes \u201d.
+    # State persists across segments via quote_state to avoid same-direction
+    # quotes when inline tags split a paragraph (Bug: <p>"Hello <em>World</em>"</p>
+    # → 3 segments, each would reset left=True, corrupting paired quotes).
     if '"' in processed:
         result = []
-        left = True
+        if quote_state is None:
+            quote_state = {"left": True}
         for ch in processed:
             if ch == '"':
-                result.append('\u201c' if left else '\u201d')
-                left = not left
+                result.append('\u201c' if quote_state["left"] else '\u201d')
+                quote_state["left"] = not quote_state["left"]
             else:
                 result.append(ch)
         processed = ''.join(result)
@@ -1636,10 +1642,11 @@ def cmd_preprocess(args):
 
         # Apply proofread_text (phases A+B) and sentence splitting
         proofread_segments = []
+        quote_state = {"left": True}  # persist quote parity across segments
         for seg in chapter_data.get("segments", []):
             original = seg.get("content", "")
             processed, blacklisted, bl_hits = proofread_text(
-                original, glossary, blacklist
+                original, glossary, blacklist, quote_state
             )
             if blacklisted:
                 total_blacklisted += 1
@@ -1881,9 +1888,10 @@ def cmd_reprocess(args):
             chapter_data = json.load(f)
 
         proofread_segments = []
+        quote_state = {"left": True}  # persist quote parity across segments
         for seg in chapter_data.get("segments", []):
             original = seg.get("content", "")
-            processed, blacklisted, bl_hits = proofread_text(original, glossary, blacklist)
+            processed, blacklisted, bl_hits = proofread_text(original, glossary, blacklist, quote_state)
             if blacklisted:
                 total_blacklisted += 1
             processed = apply_mechanical_style_fixes(processed)
@@ -1963,18 +1971,24 @@ def cmd_reprocess(args):
                     seg["content"] = new_pp  # No LLM edits, use new pp
                     merged_segments += 1
                 else:
-                    # Safety check: if LLM rewrote the segment heavily
-                    # (LCS ratio < 0.4), skip merge and keep corrected.
-                    # Character-level merge on Chinese heavy-rewrites
-                    # can produce truncated/incorrect output.
-                    lcs = difflib.SequenceMatcher(None, old_pp, corrected).ratio()
-                    if lcs < 0.4:
-                        seg["content"] = corrected  # keep LLM version as-is
+                    # Safety checks before 3-way merge:
+                    # 1. Very short segments (< 15 chars) risk character-level
+                    #    merge artifacts (single-char diffs → garbled output
+                    #    in 0.4-0.6 LCS range). Keep LLM version as-is.
+                    # 2. Heavy rewrites (LCS < 0.45): skip merge, keep LLM
+                    #    version. Character-level merge on restructured
+                    #    Chinese sentences produces truncated/incorrect output.
+                    if len(corrected) < 15:
+                        pass  # keep LLM version, too short for safe merge
                     else:
-                        merged = _three_way_merge(old_pp, corrected, new_pp)
-                        if merged != corrected:
-                            seg["content"] = merged
-                            merged_segments += 1
+                        lcs = difflib.SequenceMatcher(None, old_pp, corrected).ratio()
+                        if lcs < 0.45:
+                            pass  # keep LLM version, heavy rewrite
+                        else:
+                            merged = _three_way_merge(old_pp, corrected, new_pp)
+                            if merged != corrected:
+                                seg["content"] = merged
+                                merged_segments += 1
 
             tmp_path = extracted_dir / f"chapter_{chapter:04d}_corrected.json.tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -2701,9 +2715,29 @@ def cmd_inject(args):
                     else:
                         last_idx = idx + len(repl)
                 else:
+                    # Last resort: whitespace-normalized regex search.
+                    # Preprocessing may normalize \r\n→\n, double spaces→single
+                    # between extract and inject. Build a whitespace-flexible
+                    # regex from normalized orig to catch these cases.
                     if orig != repl:
+                        orig_norm = re.sub(r'\s+', ' ', orig).strip()
+                        if orig_norm:
+                            pattern = re.escape(orig_norm)
+                            pattern = re.sub(r'\\ ', r'\\s+', pattern)
+                            m = re.search(pattern, content[last_idx:])
+                            if m:
+                                idx = last_idx + m.start()
+                                orig = m.group()
+                                orig_len = len(orig)
+                                escaped = False
+                                entity_form = None
+                            else:
+                                skipped_local += 1
+                        else:
+                            skipped_local += 1
+                    else:
                         skipped_local += 1
-                    # Origin text not found in any entity form. Skip this
+                    # If still not found after normalization, skip this
                     # segment rather than guessing cursor position — heuristic
                     # advance could cause wrong-text injection on next segment.
             # Write XHTML via temp file to avoid corruption on crash/disk-full.
@@ -3371,7 +3405,12 @@ def _auto_generate_corrections(work_dir):
                         has_cn = True
                         break
                 if has_cn:
-                    nc = " "
+                    # Guard: English with 3+ lines (2+ line breaks) is likely
+                    # deliberate literary content (poems, letters, spells).
+                    # Single newlines may be HTML formatting artifacts in
+                    # translation residue; only protect multi-line structure.
+                    if len(c.splitlines()) < 3:
+                        nc = " "
 
             if nc != c:
                 corrections.append({
@@ -3481,9 +3520,13 @@ def _cleanup_residual_english(work_dir):
                     break
 
             if has_cn:
-                s["content"] = " "
-                missed_deleted += 1
-                modified = True
+                # Guard: skip literary English (3+ lines = deliberate structure)
+                if len(corr_content.splitlines()) < 3:
+                    s["content"] = " "
+                    missed_deleted += 1
+                    modified = True
+                else:
+                    missed_flagged += 1
             else:
                 missed_flagged += 1
 
