@@ -50,6 +50,11 @@ VARIANTS = [
     # Proper-prefix pairs
     ("卡莫林", "卡莫林特", 4, 2),
     ("维诺斯", "维诺斯特", 4, 2),
+
+    # Insertion pairs: longer form inserts one CJK char before a shared suffix.
+    # These previously leaked through because the detector only checked tail extras.
+    ("娜玛", "娜玛亚", 5, 2),
+    ("艾露城", "艾露亚城", 4, 2),
 ]
 
 # Known limitation: same referent, but the current heuristic does not catch it

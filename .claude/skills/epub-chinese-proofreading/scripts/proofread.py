@@ -3085,7 +3085,7 @@ def _find_suspected_variants(extracted_dir, top_n=30):
                 if raw[0] in _COMMON_STARTS:
                     continue
                 # Strip trailing non-transliteration char (likely verb/particle)
-                if len(raw) >= 3 and raw[-1] not in _TRANSLITERATION_CHARS:
+                if len(raw) >= 3 and raw[-1] not in _TRANSLITERATION_CHARS and raw[-1] not in _SEMANTIC_SUFFIXES:
                     raw = raw[:-1]
                 if len(raw) >= 2:
                     tokens[raw] += 1
@@ -3137,7 +3137,9 @@ def _find_suspected_variants(extracted_dir, top_n=30):
                     # Different lengths: first 2 chars must match
                     if a[:2] == b[:2]:
                         shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-                        extra = longer[len(shorter):]
+                        extra_counts = collections.Counter(longer)
+                        extra_counts.subtract(collections.Counter(shorter))
+                        extra = ''.join(c for c, n in extra_counts.items() for _ in range(max(0, n)))
                         if any(c in _SEMANTIC_SUFFIXES and c not in _TRANSLITERATION_CHARS for c in extra):
                             continue
                         candidates.append((a, b))
