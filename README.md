@@ -1,6 +1,6 @@
 # EPUB 中文出版校对
 
-一键懒人化：丢一个 EPUB 进去，LLM 自动完成术语统一、翻译腔消除、网文词替换，输出校对后的 EPUB。全程无需干预。
+一键懒人化：丢一个 EPUB 进去，Python 自动完成机械准备，Claude 按 batch 深度校对术语、翻译腔和网文词，最终输出校对后的 EPUB。
 
 ## 安装
 
@@ -35,7 +35,7 @@ Claude 自动完成全部流程：
 | pipeline | Python | 解包→提取→机械预处理→分卷→术语变体预扫描→英文术语检测→自动修正→生成 TASK.md |
 | 第1轮校对 | LLM | 逐 batch 深度阅读，搜集术语变体，处理黑名单标记 |
 | 第2轮校对 | LLM | 逐 batch 精修：英文处理、翻译腔消除、AI套话、风格统一 |
-| 检查+注入+打包 | Python | check --diff→check --glossary→inject→pack → 输出统计报告 |
+| 检查+注入+打包 | Python | check --diff→inject→check --glossary→pack → 输出统计报告 |
 | 第3轮润色 | LLM | 翻译腔深化、欧化句拆分、标点规范、角色声音增强、朗读节奏（**用户确认后执行**） |
 
 全程无剧透（终端只显示计数），最终输出 `output.epub`。
@@ -55,7 +55,7 @@ Claude 自动完成全部流程：
 
 ```bash
 # 步骤 1：一键机械准备
-python scripts/proofread.py pipeline 小说.epub --profile fantasy
+python scripts/proofread.py pipeline 小说.epub --profile fantasy --work-dir ./work/
 
 # 步骤 2：将 full_text.txt（或 proofread_batches/ 下的分卷）
 #        发给任意 LLM 进行校对，输出 corrections.json
@@ -65,10 +65,12 @@ python scripts/proofread.py apply-corrections ./work/ corrections.json
 
 # 步骤 4：检查 + 注入 + 打包
 python scripts/proofread.py check --diff ./work/
-python scripts/proofread.py check --glossary ./work/
 python scripts/proofread.py inject ./work/
+python scripts/proofread.py check --glossary ./work/
 python scripts/proofread.py pack ./work/
 ```
+
+> 不传 `--work-dir` 时，默认工作目录是 `proofread/{EPUB文件名}/work/`。
 
 ## 如何检查校对内容（防剧透设计）
 
@@ -90,7 +92,7 @@ python scripts/proofread.py check --diff-log diff.txt ./work/
 | `dump-text ./work/ [--max-chars N]` | 导出全书（自动分卷） |
 | `apply-corrections ./work/ corrections.json` | 应用 LLM 校对（自动 reprocess） |
 | `check --diff ./work/` | 检查改动量（无剧透） |
-| `check --glossary ./work/` | 验证术语覆盖率 + glossary 自检 |
+| `check --glossary ./work/` | 注入后验证术语覆盖率 + glossary 自检 |
 | `check --diff-log diff.txt ./work/` | 逐句对比（带剧透警告） |
 | `extract-terms ./work/` | 自动提取术语映射 |
 | `add-term ./work/ "原词" "替换词"` | 手动添加术语 |
@@ -109,6 +111,8 @@ python test_e2e.py                # 62 步端到端测试
 python test_skill_workflow.py     # 完整技能流程仿真
 python test_variant_detection.py  # 术语变体检测评估
 python test_targeted_fixes.py     # 针对性修复验证
+python test_variant_iso.py        # 变体检测隔离评估
+python test_variant_improvement.py # 变体检测候选算法评估
 ```
 
 ## 成本对比（传统出版校对 vs 本技能）

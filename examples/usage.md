@@ -8,7 +8,7 @@
 
 > 校对这本 EPUB
 
-Claude 会自动完成全流程。
+Python 会自动完成机械准备；Claude 随后按 TASK.md 逐 batch 深度校对。
 
 ### 场景 2：带术语表校对
 
@@ -37,21 +37,22 @@ Claude 会自动完成全流程。
 ## 分步流程（手动控制）
 
 ```bash
-# 1. 初始化
-python .claude/skills/epub-chinese-proofreading/scripts/proofread.py init input.epub work/ --glossary glossary.json
+# 1. 机械准备（解包、提取、预处理、分卷、生成 TASK.md）
+python .claude/skills/epub-chinese-proofreading/scripts/proofread.py pipeline input.epub --work-dir work/ --glossary glossary.json
 
-# 2. 提取文本
-python .claude/skills/epub-chinese-proofreading/scripts/proofread.py extract work/
+# 2. [Claude/LLM 校对] — 读取 work/TASK.md，逐 batch 输出 corrections.json
 
-# 3. [Claude 校对] — 读取 work/extracted/chapter_*.json，逐一校对
+# 3. 应用校对结果（每个 batch 后都运行一次）
+python .claude/skills/epub-chinese-proofreading/scripts/proofread.py apply-corrections work/ corrections.json
 
-# 4. 注入 & 打包
+# 4. 检查、注入、术语覆盖验证、打包
+python .claude/skills/epub-chinese-proofreading/scripts/proofread.py check --diff work/
 python .claude/skills/epub-chinese-proofreading/scripts/proofread.py inject work/
+python .claude/skills/epub-chinese-proofreading/scripts/proofread.py check --glossary work/
 python .claude/skills/epub-chinese-proofreading/scripts/proofread.py pack work/ output.epub
-
-# 5. 清理
-rm -rf work/
 ```
+
+保留 `work/`，便于检查 diff 或进行后续轮次。
 
 ## Config 自定义
 

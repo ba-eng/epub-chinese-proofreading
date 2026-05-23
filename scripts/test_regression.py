@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Regression tests for epub-chinese-proofreading skill."""
 import sys
+import os
 import html
 import re
 from lxml import etree
 
-sys.path.insert(0, '.')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from proofread import (
     extract_text_segments, _decode_xhtml, split_long_text,
     apply_mechanical_style_fixes, compute_change_ratio,
     natural_sort_key, _is_cjk, _is_valid_term_char, _ENTITY_REVERSE_MAP,
-    _safe_extract_epub,
+    _safe_extract_epub, _read_xhtml_text,
 )
 
 passed = failed = 0
@@ -502,6 +503,30 @@ with tempfile.TemporaryDirectory() as td:
     check((out_dir / "OEBPS" / "Text" / "ch1.xhtml").exists(), "16c: safe archive not extracted")
 
 print("  16 safe extraction: OK")
+print()
+
+# ============================================================
+# Test 17: XHTML encoding-aware reads
+# ============================================================
+print("=== Test 17: XHTML encoding-aware reads ===")
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = PathClass(td)
+    gbk_file = tmp / "gbk.xhtml"
+    gbk_file.write_bytes('<?xml version="1.0" encoding="GBK"?><html><body>阿拉贡</body></html>'.encode("gbk"))
+    text, enc = _read_xhtml_text(gbk_file)
+    check(enc == "gbk", f"17a: expected gbk, got {enc}")
+    check("阿拉贡" in text, "17b: GBK XHTML text did not decode")
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = PathClass(td)
+    big5_file = tmp / "big5.xhtml"
+    big5_file.write_bytes('<?xml version="1.0" encoding="Big5"?><html><body>中文</body></html>'.encode("big5"))
+    text, enc = _read_xhtml_text(big5_file)
+    check(enc == "big5", f"17c: expected big5, got {enc}")
+    check("中文" in text, "17d: Big5 XHTML text did not decode")
+
+print("  17 encoding-aware reads: OK")
 print()
 
 # ============================================================

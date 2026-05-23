@@ -1439,15 +1439,25 @@ def save_config(config, work_dir):
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 
+def _is_safe_epub_member(name):
+    """Return True if a ZIP member path cannot escape the extraction dir."""
+    normalized = name.replace("\\", "/")
+    parts = PurePosixPath(normalized).parts
+    return not (normalized.startswith("/") or ".." in parts or ":" in normalized)
+
+
 def _safe_extract_epub(zf, work_dir):
     """Extract EPUB entries without allowing archive paths outside work_dir."""
     for info in zf.infolist():
-        name = info.filename.replace("\\", "/")
-        parts = PurePosixPath(name).parts
-        # Block: absolute paths, parent traversal, and Windows drive letters
-        if name.startswith("/") or ".." in parts or ":" in name:
+        if not _is_safe_epub_member(info.filename):
             raise ValueError(f"Unsafe EPUB entry path: {info.filename}")
         zf.extract(info, work_dir)
+
+
+def _read_xhtml_text(filepath):
+    """Read XHTML/HTML bytes using the same encoding detection as parsing."""
+    with open(filepath, "rb") as f:
+        return _decode_xhtml(f.read())
 
 
 # ---------------------------------------------------------------------------
@@ -2350,8 +2360,8 @@ def cmd_check(args):
             for fp in html_files:
                 if any(p in ("extracted", "proofread_batches") for p in fp.parts):
                     continue
-                with open(fp, "r", encoding="utf-8") as f:
-                    html_text += f.read()
+                content, _ = _read_xhtml_text(fp)
+                html_text += content
 
             # Check each CJK glossary key for residual occurrences
             residual = []
@@ -2514,6 +2524,8 @@ def cmd_inject(args):
                 restored = 0
                 for _n in _zf.namelist():
                     if _n.endswith('.html') or _n.endswith('.xhtml'):
+                        if not _is_safe_epub_member(_n):
+                            raise ValueError(f"Unsafe EPUB entry path: {_n}")
                         # Use full ZIP internal path, not basename.
                         # EPUBs commonly store XHTML in OEBPS/Text/ etc.
                         _dest = work_dir / _n
@@ -2861,8 +2873,7 @@ def _apply_glossary_to_xhtml(work_dir):
                          list(Path(work_dir).rglob("*.html"))):
         if any(p in ("extracted", "proofread_batches") for p in fpath.parts):
             continue
-        with open(fpath, "r", encoding="utf-8") as f:
-            content = f.read()
+        content, file_encoding = _read_xhtml_text(fpath)
         original = content
 
         # Protect <style> and <script> blocks from regex replacement
@@ -2901,8 +2912,7 @@ def _apply_glossary_to_xhtml(work_dir):
             content = re.sub(r"<" + tag + r"[^>]*>\s*</" + tag + ">", "", content)
 
         if content != original:
-            m = re.search(r"encoding=['\x22]([^'\x22]+)['\x22]", original)
-            enc = m.group(1) if m else "utf-8"
+            enc = file_encoding
             # Atomic write to prevent truncated XHTML on crash
             tmp_path = Path(str(fpath) + ".tmp")
             try:
