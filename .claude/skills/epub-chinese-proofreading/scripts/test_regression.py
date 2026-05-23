@@ -340,9 +340,10 @@ check("\uff0c" in result, f"12a: end-of-string comma not converted: {repr(result
 result = apply_mechanical_style_fixes("他说:")
 check("\uff1a" in result, f"12b: end-of-string colon not converted: {repr(result)}")
 
-# Test 12c: semicolon at end
+# Test 12c: semicolon at end — should convert to fullwidth comma (not semicolon).
+# Chinese fiction uses ； extremely rarely; semicolons are translation artifacts.
 result = apply_mechanical_style_fixes("他说;")
-check("\uff1b" in result, f"12c: end-of-string semicolon not converted: {repr(result)}")
+check("\uff0c" in result, f"12c: end-of-string semicolon not converted to comma: {repr(result)}")
 
 # Test 12d: comma before English — should NOT convert (protect mixed content)
 result = apply_mechanical_style_fixes("他说,hello")

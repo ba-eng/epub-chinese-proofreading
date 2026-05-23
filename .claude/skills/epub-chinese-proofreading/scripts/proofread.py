@@ -1205,9 +1205,15 @@ def apply_mechanical_style_fixes(text):
     # Use negative lookahead instead of positive — the latter fails on
     # text-node-final punctuation (e.g. <p>他说,</p> has no char after ,).
     text = re.sub(r'(?<=[\u4e00-\u9fff\s]),(?![a-zA-Z0-9])', '\uff0c', text)
-    text = re.sub(r'(?<=[\u4e00-\u9fff]);(?![a-zA-Z0-9])', '\uff1b', text)
+    # Semicolon: CJK-context → fullwidth comma (not fullwidth semicolon).
+    # Chinese fiction uses ； extremely rarely; most are translation artifacts.
+    # Must target ，not ；— otherwise Phase A2 (which runs before this function
+    # in proofread_text) never sees ASCII semicolons converted here, and the
+    # ；→， pass in proofread_text misses them.
+    text = re.sub(r'(?<=[\u4e00-\u9fff]);(?![a-zA-Z0-9])', '\uff0c', text)
+    # Catch any ； that survived Phase A2 (e.g. from reprocess or edge cases)
+    text = text.replace('\uff1b', '\uff0c')
     text = re.sub(r'(?<=[\u4e00-\u9fff]):(?![a-zA-Z0-9])', '\uff1a', text)
-
     # --- 翻译腔修正 is NOT done mechanically ---
     # "被X所Y", "开始X起来" and similar patterns cannot be blindly
     # regex-replaced — they match common Chinese vocabulary (被子, 被告,
@@ -1979,7 +1985,17 @@ def cmd_reprocess(args):
                     #    version. Character-level merge on restructured
                     #    Chinese sentences produces truncated/incorrect output.
                     if len(corrected) < 15:
-                        pass  # keep LLM version, too short for safe merge
+                        # Too short for safe 3-way merge, but still apply
+                        # glossary regex so short segments get term updates.
+                        # (Without this, old terms in short dialogue like
+                        # "好"/"走吧" survive reprocess indefinitely.)
+                        if glossary and _GLOSSARY_REGEX.pattern:
+                            updated, cnt = _GLOSSARY_REGEX.subn(
+                                lambda m: glossary.get(m.group(0), m.group(0)),
+                                corrected)
+                            if cnt > 0:
+                                seg["content"] = updated
+                                merged_segments += 1
                     else:
                         lcs = difflib.SequenceMatcher(None, old_pp, corrected).ratio()
                         if lcs < 0.45:
@@ -2833,8 +2849,10 @@ def _apply_glossary_to_xhtml(work_dir):
             orig_t = t
             if all_regex is not None:
                 t, _ = all_regex.subn(lambda m2: glossary.get(m2.group(0), m2.group(0)), t)
-            if t != orig_t:
-                t = re.sub(r" +", " ", t).strip()
+            # Note: no space normalization here. Glossary replacement is a
+            # clean term→term substitution that doesn't introduce extra
+            # whitespace. Previous `re.sub(r" +", " ", t).strip()` destroyed
+            # deliberate spacing in poetry, lyrics, and inline-element gaps.
             return ">" + t + "<"
 
         content = re.sub(r">([^<]+)<", _replace_text, content)
@@ -2881,6 +2899,8 @@ def _apply_glossary_to_xhtml(work_dir):
 
     if total:
         print(f"  Glossary->XHTML: {total} files updated ({len(glossary)} terms, ASCII+CJK)")
+
+
 def cmd_pack(args):
     """Repack EPUB from work directory. Output to project directory if available."""
     work_dir = Path(args.work_dir)
@@ -3050,6 +3070,7 @@ def _find_suspected_variants(extracted_dir, top_n=30):
         "说道对和与教看想问答笑叫走来去出进回做是在有"
         "我你他她它们这那什谁吗呢吧啊哦嗯么"
         "低轻双以用鞠便躬摇发告诉知高长短好坏多少新旧快慢"
+        "脚并逃都见请示可罢即乃予收俯潜拥早永开系措欢足遭覆随未没曾旁将之赞"
     )
     _token_re = re.compile(r'[\u4e00-\u9fff]{2,6}')
     tokens = collections.Counter()
@@ -3281,7 +3302,7 @@ def _generate_voice_cards(work_dir):
             continue
         if name in known_names:
             major[name] = samples
-        elif len(samples) >= 8:
+        elif len(samples) >= 8 and name[0] not in "我你他她它这那":
             major[name] = samples  # frequent enough, likely real character
 
     if not major:
@@ -3656,6 +3677,25 @@ def _write_task_md(work_dir):
         lines.append("")
         lines.append("**用法**：确认为专有术语后，在 glossary_additions 中添加翻译映射。")
         lines.append("常见英文单词（the/and/he/she 等）可忽略。pack 时会自动应用 glossary 到 EPUB。")
+
+    # Cross-script bridging: connect English terms to Chinese variant pairs
+    if variants and english_terms:
+        lines.extend([
+            "",
+            "### 跨文字桥接（英文术语 ↔ 中文异译）",
+            "",
+            "**注意**：上方两个列表可能存在对应关系。同一外文专名的**英文原词**和**中文异译**应一并处理。",
+            "请在确认术语时对照两组列表：",
+            "- 如果英文术语（如 `hyacinthe`）与某组中文变体（如 海辛瑟/希亚辛特）指向同一外文名 → 统一中文译名，并在 glossary_additions 中添加英文→中文映射",
+            "- 如果英文术语在中文变体列表中**没有**对应 → 该外文名可能尚未翻译，需确认后写入 glossary_additions",
+            "- 如果中文变体在英文术语列表中**没有**对应原词 → 该外文名可能来自非英文源语言，或英文原词被其他词取代",
+            "",
+            "**示例确认流程**：",
+            "1. 找到英文术语 `trevalion` → 在中变体列表搜索「特雷瓦」→ 确认对应关系",
+            "2. 写入 `glossary_additions`：`trevalion`→`特雷瓦利翁`（统一译名）",
+            "3. 中文异译（特雷瓦利昂/特里瓦利翁）自动归并为统一译名",
+            "",
+        ])
 
     lines.extend([
         "",
