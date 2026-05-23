@@ -1019,16 +1019,11 @@ def cmd_apply_corrections(args):
                         parts = target["_parts"]
                         if parts:
                             parts[0]["content"] = corrected
-                            # Also update original so inject can find the text
-                            if parts[0].get("original") is not None:
-                                parts[0]["original"] = corrected
                             for p in parts[1:]:
                                 p["content"] = ""
                         applied += 1
                     else:
                         target["content"] = corrected
-                        if target.get("original") is not None:
-                            target["original"] = corrected
                         applied += 1
 
             out_path = extracted_dir / f"chapter_{ch:04d}_corrected.json"
