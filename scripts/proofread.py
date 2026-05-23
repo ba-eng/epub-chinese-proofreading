@@ -530,8 +530,8 @@ def proofread_text(text, glossary, blacklist, quote_state=None, advisory_blackli
         processed = ''.join(result)
 
     # Phase B: Blacklist FLAGGING — mark for treatment, don't skip
-    hits = [w for w in blacklist if w in processed]
     processed = apply_mechanical_style_fixes(processed)
+    hits = [w for w in blacklist if w in processed]
     advisory_hits = [w for w in (advisory_blacklist or []) if w in processed]
     if advisory_blacklist is not None:
         return (processed, bool(hits), hits, advisory_hits)
@@ -1719,7 +1719,6 @@ def cmd_preprocess(args):
                 total_blacklisted += 1
             # Blacklisted segments still get full treatment — the flag only
             # marks words that Claude should replace during phase C
-            processed = apply_mechanical_style_fixes(processed)
             # Flag English-heavy segments so ALL sub-segments get the marker
             is_english = _is_english_heavy(processed)
             sentences = split_long_text(processed, threshold, split_punc)
@@ -1951,7 +1950,6 @@ def cmd_reprocess(args):
             )
             if blacklisted:
                 total_blacklisted += 1
-            processed = apply_mechanical_style_fixes(processed)
             # Flag English-heavy segments (same logic as cmd_preprocess)
             is_english = _is_english_heavy(processed)
             sentences = split_long_text(processed, threshold, split_punc)
