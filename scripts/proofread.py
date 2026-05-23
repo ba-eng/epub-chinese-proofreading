@@ -965,8 +965,11 @@ def cmd_apply_corrections(args):
     if corrections:
         by_chapter = {}
         for c in corrections:
+            if "chapter" not in c:
+                print(f"  Warning: skipping correction without 'chapter' field: {c.get('segment_id', '?')}")
+                continue
             try:
-                ch = int(c.get("chapter", 0))
+                ch = int(c["chapter"])
             except (ValueError, TypeError):
                 continue
             by_chapter.setdefault(ch, []).append(c)
@@ -2051,6 +2054,7 @@ def cmd_check(args):
         # Auto-fix if requested (operates on grouped data).
         # Use per-chapter counter — total_reverted spans all chapters
         # and would cause false file rewrites for subsequent chapters.
+        violations = []
         chapter_reverted = 0
         if do_fix:
             for sid, parts in seg_groups:
@@ -2103,7 +2107,6 @@ def cmd_check(args):
                     json.dump(proofread_data, f, ensure_ascii=False, indent=2)
 
         # Check violations on grouped data
-        violations = []
         for sid, parts in seg_groups:
             # parts = [(idx_in_segs, dict), ...]
             first_seg = parts[0][1]
@@ -2689,36 +2692,36 @@ def cmd_inject(args):
                 else:
                     if orig != repl:
                         skipped_local += 1
-                    # Even when not found, advance cursor by original decoded
-                    # length (not escaped) to minimize overshoot.
-                    last_idx = last_idx + orig_len
-            with open(fp, "wb") as f:
+                    # Origin text not found in any entity form. Skip this
+                    # segment rather than guessing cursor position — heuristic
+                    # advance could cause wrong-text injection on next segment.
+            # Write XHTML via temp file to avoid corruption on crash/disk-full.
+            # Non-atomic truncation would leave a zero-byte file if interrupted.
+            tmp_path = str(fp) + ".tmp"
+            with open(tmp_path, "wb") as f:
                 try:
                     f.write(content.encode(file_encoding))
                 except UnicodeEncodeError:
                     # LLM may have introduced characters outside the original
                     # encoding's repertoire (e.g., CJK Extension chars in GBK).
-                    # Fall back to UTF-8 and update ALL encoding declarations:
-                    # XML declaration, HTML5 <meta charset>, HTML4 <meta content>.
+                    # Fall back to UTF-8 and update ALL encoding declarations.
                     content = re.sub(
                         r'encoding\s*=\s*["\'][^"\']+["\']',
                         'encoding="UTF-8"',
-                        content,
-                        count=1
+                        content, count=1
                     )
                     content = re.sub(
                         r'(<meta\s+charset\s*=\s*["\'])[^"\']+(["\'])',
                         r'\1UTF-8\2',
-                        content,
-                        flags=re.IGNORECASE
+                        content, flags=re.IGNORECASE
                     )
                     content = re.sub(
                         r'(<meta\s+[^>]*charset\s*=\s*)[^"\'\s;]+',
                         r'\1UTF-8',
-                        content,
-                        flags=re.IGNORECASE
+                        content, flags=re.IGNORECASE
                     )
                     f.write(content.encode("utf-8"))
+            os.replace(tmp_path, fp)
             total_skipped += skipped_local
 
         print(f"  [{chapter:04d}] {rel_path} — applied ({skipped_local} skipped)")
