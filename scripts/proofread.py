@@ -2652,12 +2652,7 @@ def cmd_inject(args):
         # text appears at multiple positions and only some changed.
         skipped_local = 0
         if all_segments:
-            with open(fp, "rb") as f:
-                raw = f.read()
-
-            # Detect encoding: try XML declaration → utf-8 → gbk fallback.
-            # Old Chinese EPUBs often use GBK/Big5; blind utf-8 decode crashes.
-            content, file_encoding = _decode_xhtml(raw)
+            content, file_encoding = _read_xhtml_text(fp)
 
             skipped_local = 0
             last_idx = 0
