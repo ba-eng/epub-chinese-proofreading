@@ -1,6 +1,6 @@
 # EPUB 中文出版校对
 
-一键懒人化：用户提供 EPUB 小说路径，Claude 自动完成术语统一、翻译腔消除、网文词替换，输出校对后的 EPUB。
+一键懒人化：丢一个 EPUB 进去，LLM 自动完成术语统一、翻译腔消除、网文词替换，输出校对后的 EPUB。全程无需干预。
 
 ## 安装
 
@@ -22,45 +22,39 @@ git clone https://github.com/kiloiam/epub-chinese-proofreading.git .claude/skill
 
 ### 方式一：Claude Code 技能（推荐，全自动）
 
-在 Claude Code 对话中说「校对 EPUB」，Claude 会激活技能并询问文件路径。或者直接说：
+在 Claude Code 对话中说「校对 EPUB」，或直接指定路径：
 
 ```
 校对 EPUB：/home/user/小说.epub
 ```
 
 Claude 自动完成全部流程：
-1. 解包 EPUB，提取正文（过滤 CSS/JS/注释）
-2. 机械预处理（glossary 术语替换 + 网文词标记）
-3. 导出全文（100K 字自动分卷 + 上下文重叠）
-4. 逐卷校对（术语统一、翻译腔修正、网文词替换）
-5. 检查改动量 → 二进制注入 → 打包输出
+
+| 阶段 | 谁做 | 内容 |
+|------|------|------|
+| pipeline | Python | 解包→提取→机械预处理→分卷→术语变体预扫描→英文术语检测→自动修正→生成 TASK.md |
+| 第1轮校对 | LLM | 逐 batch 深度阅读，搜集术语变体，处理黑名单标记 |
+| 第2轮校对 | LLM | 逐 batch 精修：英文处理、翻译腔消除、AI套话、风格统一 |
+| 检查+注入+打包 | Python | check --diff→check --glossary→inject→pack → 输出统计报告 |
+| 第3轮润色 | LLM | 翻译腔深化、欧化句拆分、标点规范、角色声音增强、朗读节奏（**用户确认后执行**） |
 
 全程无剧透（终端只显示计数），最终输出 `output.epub`。
 
-> **注意**：如果全书超过 15 万字，Claude 需要分多轮逐个 batch 处理。只需回复"继续下一个 batch"即可。
+> **注意**：如果全书超过 10 万字，pipeline 会自动分卷（每卷 100K 字 + 相邻卷 2000 字上下文重叠），LLM 逐个 batch 处理。
 
-### 可选：术语预扫描
+### pipeline 自动术语预扫描
 
-默认不会做术语预扫描。只有当你明确说“先做术语预扫描”“长篇术语很多，先建术语表”等需求时，才使用这个流程。
+`pipeline` 第4步**默认自动执行**两项扫描，结果写入 TASK.md：
 
-适合：长篇/系列小说、专有名词密集、AI 分块翻译异译严重的 EPUB。
+- **疑似术语变体**（`_find_suspected_variants`）：统计推断全书中的同指异译对（共享字符+同首字+长度相近），标注共现频率，供 LLM 第1轮逐对确认
+- **未翻译英文术语**（`_find_english_terms`）：检测高频英文词（出现≥3次），识别应翻译为中文的专有术语
 
-```bash
-python scripts/proofread.py init 小说.epub ./work/
-python scripts/proofread.py extract ./work/
-python scripts/proofread.py term-prescan ./work/
-# 读取 ./work/TERM_SCAN_TASK.md，让 LLM 输出 term_scan_result.json
-python scripts/proofread.py apply-term-scan ./work/ term_scan_result.json
-python scripts/proofread.py preprocess ./work/
-python scripts/proofread.py dump-text ./work/ --max-chars 150000
-```
+无需手动触发。LLM 在 TASK.md 中直接看到扫描结果。
 
-`term-prescan` 只生成扫描材料，不会改正文；`apply-term-scan` 只应用明确输出的 `glossary_additions`。不确定项应放入 `conflicts_need_human`，不会自动应用。
-
-### 方式二：命令行手动（不依赖 Claude）
+### 方式二：pipeline + 手动 LLM
 
 ```bash
-# 步骤 1：机械准备（解包 + 提取 + 预处理 + 导出）
+# 步骤 1：一键机械准备
 python scripts/proofread.py pipeline 小说.epub --profile fantasy
 
 # 步骤 2：将 full_text.txt（或 proofread_batches/ 下的分卷）
@@ -74,47 +68,47 @@ python scripts/proofread.py check --diff ./work/
 python scripts/proofread.py check --glossary ./work/
 python scripts/proofread.py inject ./work/
 python scripts/proofread.py pack ./work/
-
-# 输出在 ~/.claude/proofread/{书名}/output.epub
 ```
 
 ## 如何检查校对内容（防剧透设计）
 
-**默认行为**：所有终端输出只显示计数（如"3 segments modified"），不会打印小说正文。保护未读完的读者不被剧透。
+所有终端输出只显示计数（如"3 segments modified"），不会打印小说正文。
 
-**如需审查**：已完成阅读的用户可以导出详细对比文件：
+如需审查，已完成阅读的用户可以导出详细对比文件：
 
 ```bash
 python scripts/proofread.py check --diff-log diff.txt ./work/
 ```
 
-生成的 `diff.txt` 文件头部有 **SPOILER WARNING** 横幅，逐句列出原文与校对后的对比（`-` 原文 / `+` 校对后）。由用户自主决定是否查看。
-
-如果是 Claude Code 技能模式，对 Claude 说"帮我导出 diff 检查一下校对结果"即可。
+生成的 `diff.txt` 头部带 **SPOILER WARNING** 横幅，逐句列出原文与校对后对比。用户自主决定是否查看。
 
 ## 命令参考
 
 | 命令 | 作用 |
 |------|------|
-| `pipeline in.epub [--profile fantasy]` | 一键机械准备 |
-| `dump-text ./work/ [--max-chars 150000]` | 导出全书（自动分卷） |
-| `apply-corrections ./work/ corrections.json` | 应用 LLM 校对 |
+| `pipeline in.epub [--profile fantasy] [--max-chars N]` | 一键机械准备 + 术语预扫描 + 自动修正 |
+| `dump-text ./work/ [--max-chars N]` | 导出全书（自动分卷） |
+| `apply-corrections ./work/ corrections.json` | 应用 LLM 校对（自动 reprocess） |
 | `check --diff ./work/` | 检查改动量（无剧透） |
 | `check --glossary ./work/` | 验证术语覆盖率 + glossary 自检 |
 | `check --diff-log diff.txt ./work/` | 逐句对比（带剧透警告） |
 | `extract-terms ./work/` | 自动提取术语映射 |
 | `add-term ./work/ "原词" "替换词"` | 手动添加术语 |
+| `add-terms ./work/ '[{"term":"x","translation":"y"}]'` | 批量添加术语 |
 | `reprocess ./work/` | glossary 更新后重跑预处理 |
 | `inject ./work/` | 校对文本注入 EPUB |
 | `pack ./work/` | 打包输出 EPUB |
+| `config ./work/ --show` | 显示当前配置 |
 
 ## 测试
 
 ```bash
 cd scripts
-python test_regression.py    # 86 项单元测试
-python test_e2e.py            # 62 步端到端测试
-python test_skill_workflow.py # 完整技能流程仿真
+python test_regression.py        # 86 项单元测试
+python test_e2e.py                # 62 步端到端测试
+python test_skill_workflow.py     # 完整技能流程仿真
+python test_variant_detection.py  # 术语变体检测评估
+python test_targeted_fixes.py     # 针对性修复验证
 ```
 
 ## 成本对比（传统出版校对 vs 本技能）
@@ -133,7 +127,7 @@ python test_skill_workflow.py # 完整技能流程仿真
 | | 传统一校 | 本技能 |
 |---|---|---|
 | 术语一致性 | 人工追踪 1000+ 专名必然有漏 | 1201 条零遗漏，跨章机械传播 |
-| 英文残留 | 能清，但体力活 | 自动检测+删除/翻译 |
+| 英文残留 | 能清，但体力活 | 3层防护：自动检测+删除/翻译+注入前清扫 |
 | 网文词替换 | 编辑凭经验，标准因人而异 | 36 词黑名单 + LLM 上下文感知替换 |
 | 翻译腔检测 | 编辑凭语感 | 7 种模式对照 + LLM 逐段判断 |
 | 速度 | 50-80 页/天 | 55 万字/小时 |

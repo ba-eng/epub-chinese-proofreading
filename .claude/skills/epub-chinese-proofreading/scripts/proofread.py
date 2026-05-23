@@ -3051,7 +3051,7 @@ def _find_suspected_variants(extracted_dir, top_n=30):
         "我你他她它们这那什谁吗呢吧啊哦嗯么"
         "低轻双以用鞠便躬摇发告诉知高长短好坏多少新旧快慢"
     )
-    _token_re = re.compile(r'[\u4e00-\u9fff]{2,4}')
+    _token_re = re.compile(r'[\u4e00-\u9fff]{2,6}')
     tokens = collections.Counter()
     for fpath in sorted(extracted_dir.glob("chapter_*_preprocessed.json")):
         with open(fpath, "r", encoding="utf-8") as f:
