@@ -55,12 +55,19 @@ VARIANTS = [
     # These previously leaked through because the detector only checked tail extras.
     ("娜玛", "娜玛亚", 5, 2),
     ("艾露城", "艾露亚城", 4, 2),
+
+    # Pinyin-only transliteration pairs: same/near pinyin, different glyphs.
+    ("艾露亚", "埃鲁", 4, 3),
 ]
 
-# Known limitation: same referent, but the current heuristic does not catch it
-# because neither the first 2 chars nor suffix[1:] match.
+
+# These should not be reported just because some syllables overlap.
+FALSE_POSITIVE_GUARDS = [
+    ("知道", "直到", 6, 6),
+    ("心里", "新历", 5, 5),
+]
+
 KNOWN_UNDETECTABLE = [
-    ("爱卢亚", "艾露亚", 3, 3),
 ]
 
 GROUND_TRUTH = {tuple(sorted([a, b])) for a, b, *_ in VARIANTS + KNOWN_UNDETECTABLE}
@@ -81,6 +88,9 @@ DISTRACTORS = [
 def build_corpus(tmpdir):
     items = []
     for a, b, ca, cb in VARIANTS + KNOWN_UNDETECTABLE:
+        items.extend([a] * ca)
+        items.extend([b] * cb)
+    for a, b, ca, cb in FALSE_POSITIVE_GUARDS:
         items.extend([a] * ca)
         items.extend([b] * cb)
     for word, count in DISTRACTORS:
@@ -134,6 +144,7 @@ def run_test():
         print(f"Expected production detections: {len(EXPECTED_PRODUCTION)}")
         print(f"Actual production detections: {len(detected)}")
         print(f"Distractors: {len(DISTRACTORS)}")
+        print(f"False-positive guard pairs: {len(FALSE_POSITIVE_GUARDS)}")
         print(f"Unique variant tokens: {(len(VARIANTS) + len(KNOWN_UNDETECTABLE)) * 2}")
 
         print(f"\n{'Metric':>20} {'Value':>12}")

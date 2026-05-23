@@ -3114,6 +3114,8 @@ def _find_suspected_variants(extracted_dir, top_n=30):
             g.append(t)
 
     candidates = []
+    pinyin_pairs = set()
+    pinyin_scores = {}
     for _char, group in by_first.items():
         if len(group) < 2:
             continue
@@ -3131,6 +3133,9 @@ def _find_suspected_variants(extracted_dir, top_n=30):
                         diff_chars = [a[k] for k in range(len(a)) if a[k] != b[k]]
                         diff_chars += [b[k] for k in range(len(b)) if a[k] != b[k]]
                         if any(c in _SEMANTIC_SUFFIXES and c not in _TRANSLITERATION_CHARS for c in diff_chars):
+                            continue
+                        # Avoid common-word homographs such as 心脏/心里; pinyin pass covers name drift.
+                        if a[-1] in _SEMANTIC_SUFFIXES or b[-1] in _SEMANTIC_SUFFIXES:
                             continue
                         candidates.append((a, b))
                 elif len(a) >= 2 and len(b) >= 2:
@@ -3173,6 +3178,105 @@ def _find_suspected_variants(extracted_dir, top_n=30):
                     # shared = len-1 (all suffix chars match)
                     candidates.append((a, b))
 
+    # Pinyin comparison: catches same-sound transliteration drift with different chars
+    # (e.g., 艾露亚/埃鲁) without doing broad fuzzy matching on ordinary words.
+    _PINYIN_FALLBACK = {
+        "阿": "a", "艾": "ai", "埃": "ai", "爱": "ai", "安": "an", "奥": "ao",
+        "巴": "ba", "拜": "bai", "百": "bai", "贝": "bei", "冰": "bing", "伯": "bo", "波": "bo", "布": "bu",
+        "卡": "ka", "凯": "kai", "科": "ke", "柯": "ke", "克": "ke", "库": "ku", "昆": "kun",
+        "丹": "dan", "达": "da", "德": "de", "迪": "di", "蒂": "di", "顿": "dun", "敦": "dun",
+        "尔": "er", "恩": "en", "法": "fa", "菲": "fei", "芬": "fen", "弗": "fu", "夫": "fu",
+        "格": "ge", "哈": "ha", "赫": "he", "吉": "ji", "加": "jia", "迦": "jia", "嘉": "jia",
+        "拉": "la", "兰": "lan", "岚": "lan", "莱": "lai", "来": "lai", "勒": "le", "雷": "lei", "蕾": "lei",
+        "黎": "li", "利": "li", "里": "li", "莉": "li", "琳": "lin", "林": "lin", "伦": "lun", "罗": "luo", "洛": "luo",
+        "卢": "lu", "鲁": "lu", "露": "lu", "璐": "lu",
+        "玛": "ma", "马": "ma", "麦": "mai", "曼": "man", "蒙": "meng", "莫": "mo", "穆": "mu",
+        "娜": "na", "纳": "na", "奈": "nai", "妮": "ni", "尼": "ni", "诺": "nuo",
+        "帕": "pa", "佩": "pei", "珀": "po", "普": "pu", "琪": "qi", "齐": "qi", "琦": "qi",
+        "瑞": "rui", "萨": "sa", "塞": "sai", "桑": "sang", "瑟": "se", "森": "sen", "沙": "sha", "舍": "she",
+        "施": "shi", "士": "shi", "斯": "si", "索": "suo", "塔": "ta", "泰": "tai", "坦": "tan", "特": "te",
+        "维": "wei", "威": "wei", "韦": "wei", "沃": "wo", "温": "wen", "希": "xi", "修": "xiu",
+        "雅": "ya", "娅": "ya", "亚": "ya", "耶": "ye", "约": "yue", "扎": "zha", "朱": "zhu",
+    }
+
+    def _pinyin_syllables(token):
+        try:
+            from pypinyin import lazy_pinyin
+            syllables = lazy_pinyin(token, errors="ignore")
+            if len(syllables) == len(token):
+                return tuple(s.lower() for s in syllables if s)
+        except Exception:
+            pass
+        syllables = [_PINYIN_FALLBACK.get(ch) for ch in token]
+        if any(s is None for s in syllables):
+            return ()
+        return tuple(syllables)
+
+    def _is_translit_like(token):
+        if token[-1] in _SEMANTIC_SUFFIXES and token[-1] not in _TRANSLITERATION_CHARS:
+            return False
+        hits = sum(1 for ch in token if ch in _TRANSLITERATION_CHARS)
+        if hits >= max(2, math.ceil(len(token) * 0.6)):
+            return True
+        syllables = _pinyin_syllables(token)
+        return len(syllables) >= 2 and all(s in {
+            "a", "ai", "an", "ao", "ba", "bai", "bei", "bo", "bu", "ka", "kai", "ke", "ku", "kun",
+            "da", "dan", "de", "di", "dun", "er", "en", "fa", "fei", "fen", "fu", "ge", "ha", "he",
+            "ji", "jia", "la", "lan", "lai", "le", "lei", "li", "lin", "lu", "lun", "luo", "ma",
+            "mai", "man", "meng", "mo", "mu", "na", "nai", "ni", "nuo", "pa", "pei", "po", "pu",
+            "qi", "rui", "sa", "sai", "sang", "se", "sen", "sha", "she", "shi", "si", "suo", "ta",
+            "tai", "tan", "te", "wei", "wo", "wen", "xi", "xiu", "ya", "ye", "yue", "zha", "zhu",
+        } for s in syllables)
+
+    def _pinyin_match(a_py, b_py):
+        if len(a_py) < 2 or len(b_py) < 2 or a_py[0] != b_py[0]:
+            return 0.0
+        shorter, longer = (a_py, b_py) if len(a_py) <= len(b_py) else (b_py, a_py)
+        shared_prefix = 0
+        for x, y in zip(shorter, longer):
+            if x != y:
+                break
+            shared_prefix += 1
+        if a_py == b_py:
+            return 1.0
+        if shared_prefix >= 2 and tuple(longer[:len(shorter)]) == tuple(shorter) and len(longer) - len(shorter) <= 2:
+            if len(shorter) == 2 and len(longer) == 3:
+                return 0.8
+            return shared_prefix / len(longer)
+        return 0.0
+
+    pinyin_by_first = collections.defaultdict(list)
+    for token in freq2:
+        if not _is_translit_like(token):
+            continue
+        syllables = _pinyin_syllables(token)
+        if len(syllables) >= 2:
+            pinyin_by_first[syllables[0]].append((token, syllables))
+
+    for group in pinyin_by_first.values():
+        if len(group) < 2:
+            continue
+        group = sorted(group, key=lambda item: (-len(item[1]), item[0]))[:_MAX_GROUP_SIZE]
+        for i in range(len(group)):
+            a, a_py = group[i]
+            for j in range(i + 1, len(group)):
+                b, b_py = group[j]
+                if a == b:
+                    continue
+                match_score = _pinyin_match(a_py, b_py)
+                if match_score <= 0:
+                    continue
+                if any(ch in _SEMANTIC_SUFFIXES and ch not in _TRANSLITERATION_CHARS for ch in a + b):
+                    continue
+                if set(a).isdisjoint(set(b)) and match_score < 0.8:
+                    continue
+                if len(a) == len(b) and sum(1 for ch in a if ch in b) < len(a) - 1:
+                    continue
+                key = tuple(sorted([a, b]))
+                pinyin_pairs.add(key)
+                pinyin_scores[key] = max(pinyin_scores.get(key, 0.0), match_score)
+                candidates.append((a, b))
+
     seen = set()
     result = []
     for a, b in candidates:
@@ -3191,6 +3295,8 @@ def _find_suspected_variants(extracted_dir, top_n=30):
             max_len = max(len(a), len(b))
             freq = freq2.get(a, 0) + freq2.get(b, 0)
             score = (shared / max_len) * math.log(freq + 1)
+            if key in pinyin_pairs and shared == 0:
+                score = pinyin_scores.get(key, 0.6) * math.log(freq + 1) * 0.9
             group_key = a[0]  # first-char group
             result.append((a, b, freq, score, group_key))
     result.sort(key=lambda x: (-x[3], -x[2]))
