@@ -365,7 +365,7 @@ def get_xhtml_files(work_dir, spine_order=None):
         return files
     # Filesystem fallback — use natural sort (chapter2 before chapter10)
     xhtmls = list(work_dir.rglob("*.xhtml"))
-    htmls = list(work_dir.rglob("*.html"))
+    htmls = list(work_dir.rglob("*.html")) + list(work_dir.rglob("*.htm"))
     return sorted(xhtmls + htmls, key=natural_sort_key)
 
 
@@ -1132,19 +1132,12 @@ def _has_doubled_cjk(text):
     return bool(re.search(r'([\u4e00-\u9fff])\1', text))
 
 
-_HIGH_RISK_CJK_TERMS = set(
-    "我你他她它们这那什谁的地得了着过不只也就还却才又已正把被让给向从到"
-)
-
-
 def _validate_glossary_entry(term, translation):
     """Return None when safe, otherwise a rejection reason."""
     if not term or not translation:
         return "empty term or translation"
     if re.fullmatch(r'[\u4e00-\u9fff]', term):
         return "single-character CJK key is unsafe"
-    if term in _HIGH_RISK_CJK_TERMS:
-        return "high-risk function-word key is unsafe"
     if _has_doubled_cjk(translation):
         return "target has doubled CJK characters"
     return None
@@ -2355,7 +2348,8 @@ def cmd_check(args):
             html_text = ""
             html_files = sorted(
                 list(Path(work_dir).rglob("*.xhtml")) +
-                list(Path(work_dir).rglob("*.html"))
+                list(Path(work_dir).rglob("*.html")) +
+                list(Path(work_dir).rglob("*.htm"))
             )
             for fp in html_files:
                 if any(p in ("extracted", "proofread_batches") for p in fp.parts):
@@ -2523,7 +2517,7 @@ def cmd_inject(args):
             with _zipfile.ZipFile(input_epub) as _zf:
                 restored = 0
                 for _n in _zf.namelist():
-                    if _n.endswith('.html') or _n.endswith('.xhtml'):
+                    if _n.endswith('.html') or _n.endswith('.xhtml') or _n.endswith('.htm'):
                         if not _is_safe_epub_member(_n):
                             raise ValueError(f"Unsafe EPUB entry path: {_n}")
                         # Use full ZIP internal path, not basename.
@@ -2654,7 +2648,6 @@ def cmd_inject(args):
         if all_segments:
             content, file_encoding = _read_xhtml_text(fp)
 
-            skipped_local = 0
             last_idx = 0
             for orig, repl in all_segments:
                 orig_len = len(orig)  # capture before mutation for cursor
@@ -2865,7 +2858,8 @@ def _apply_glossary_to_xhtml(work_dir):
     ascii_count = 0
     cjk_count = 0
     for fpath in sorted(list(Path(work_dir).rglob("*.xhtml")) +
-                         list(Path(work_dir).rglob("*.html"))):
+                         list(Path(work_dir).rglob("*.html")) +
+                         list(Path(work_dir).rglob("*.htm"))):
         if any(p in ("extracted", "proofread_batches") for p in fpath.parts):
             continue
         content, file_encoding = _read_xhtml_text(fpath)
@@ -2887,7 +2881,6 @@ def _apply_glossary_to_xhtml(work_dir):
         # contains another term.
         def _replace_text(m):
             t = m.group(1)
-            orig_t = t
             if all_regex is not None:
                 t, _ = all_regex.subn(lambda m2: glossary.get(m2.group(0), m2.group(0)), t)
             # Note: no space normalization here. Glossary replacement is a
