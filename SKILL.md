@@ -97,6 +97,8 @@ python "${CLAUDE_SKILL_DIR}/scripts/proofread.py" pipeline --clean-batches "EPUB
   - 结合上下文判断：两个词是否出现在相似语境、修饰同一类对象、由同一类角色说出
   - 发现后写入 glossary_additions，统一到同一译名
 
+- **第 1 轮完成后**：pipeline 已自动生成 `voice_cards.md`（主要角色对话样本，含声调特征）。此文件在第 3 轮润色时使用，无需在第 1-2 轮处理。
+
 **第 2 轮 — 精修：**
 - `[? 英文段落]`（有相邻中文译文）已由 pipeline 自动删除，**跳过**
 - `[? 英文段落·待翻译]`（无相邻中文译文）→ 翻译为中文
@@ -257,7 +259,7 @@ python "${CLAUDE_SKILL_DIR}/scripts/proofread.py" pack {work_dir}
 
 **解决方案——第 3 轮机械标记清单：**
 `prepare-round3` 命令用正则机械检测 4 类模式并写入 `_checklist.json`，确保 checklist 不为空：
-- 翻译腔（被……所…… / 开始……起来 / ……着……着）
+- 翻译腔 7 模式（被……所…… / 是……的 / 一个……的 / 开始……起来 / ……着……着 / 该·其 / 被动态）
 - 阿拉伯数字（应汉字化）
 - 长句 >100 字（欧化断句候选）
 - CJK 粘滞（连续相同汉字，逗号插入候选）

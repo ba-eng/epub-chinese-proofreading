@@ -607,7 +607,7 @@ def _detect_round3_patterns(text):
     """
     result = {}
 
-    # 1. Translationese patterns (被……所……, 开始……起来, ……着……着)
+    # 1. Translationese patterns — all 7 patterns from SKILL.md Round 3 P1
     tl = []
     if re.search(r'被.{1,20}所', text):
         tl.append("被……所……")
@@ -615,6 +615,24 @@ def _detect_round3_patterns(text):
         tl.append("开始……起来")
     if re.search(r'着[\u4e00-\u9fff]{1,20}着', text):
         tl.append("……着……着")
+    # Pattern 4: 是……的 (at least 4 CJK chars between, to skip "是我的")
+    if re.search(r'是[\u4e00-\u9fff]{4,30}的', text):
+        tl.append("是……的")
+    # Pattern 5: 一个……的 (adjectival clustering)
+    if re.search(r'一个[\u4e00-\u9fff]{1,25}的', text):
+        tl.append("一个……的")
+    # Pattern 6: 过于正式的代词 (该/其 as standalone formal pronoun)
+    # 该 followed by CJK char (not in compounds like 应该/活该)
+    if re.search(r'(?<![应活])该[\u4e00-\u9fff]', text):
+        tl.append("该(代词)")
+    # 其 followed by CJK char (not in 其他/其它/其中/其实/其余/其次/尤其/及其)
+    if re.search(r'(?<![尤与及])其(?!他|她|它|中|实|余|次)', text):
+        tl.append("其(代词)")
+    # Pattern 7: 被动语态过滥 — 被 + verb (≥2 occurrences, exclude fixed compounds)
+    bei_hits = re.findall(r'被(?!迫|动|告|捕|害|控|诉|称|选举|认为)', text)
+    bei_unique = set(bei_hits) if bei_hits else set()
+    if len(bei_hits) >= 2:
+        tl.append(f"被动语态({len(bei_hits)}处)")
     if tl:
         result["翻译腔"] = tl
 
@@ -1190,14 +1208,45 @@ def cmd_apply_corrections(args):
 
         print(f"  Corrections: {applied} applied to chapter_NNNN_corrected.json")
 
-    # 3. Reprocess AFTER corrections — scrub LLM text with glossary too.
-    #    LLM may have written old terms (e.g. "亚拉冈") in its corrected
-    #    output because it didn't yet internalize the new glossary entry.
-    #    Reprocess applies the regex to _corrected.json content, fixing this.
+        # Post-apply verification: detect front-loaded corrections
+        # (LLM only processed early segments, skipped the rest of the chapter)
+        if corrections:
+            for ch, corrs in by_chapter.items():
+                ch_path = (extracted_dir / f"chapter_{ch:04d}_preprocessed.json")
+                if not ch_path.exists():
+                    ch_path = extracted_dir / f"chapter_{ch:04d}.json"
+                if not ch_path.exists():
+                    continue
+                with open(ch_path, "r", encoding="utf-8") as f:
+                    ch_data = json.load(f)
+                total_segs = len(ch_data.get("segments", []))
+                if total_segs < 30:
+                    continue
+                max_sid = 0
+                for c in corrs:
+                    try:
+                        sid = int(str(c.get("segment_id", "0")).split(".")[0])
+                        max_sid = max(max_sid, sid)
+                    except (ValueError, IndexError):
+                        pass
+                if max_sid > 0 and max_sid / total_segs < 0.20:
+                    print(f"  ⚠  Chapter {ch}: last corrected segment #{max_sid}/{total_segs} "
+                          f"({max_sid/total_segs:.0%}) — all corrections in early segments, "
+                          f"possible lazy scanning")
+
+    # 3. Selective reprocess AFTER corrections — only chapters containing
+    #    new glossary terms. Avoids full rescan for large books where new
+    #    terms appear in few chapters.
     if glossary_additions:
-        print(f"  Reprocessing with updated glossary...")
-        fake_args = argparse.Namespace(work_dir=str(work_dir))
-        cmd_reprocess(fake_args)
+        new_terms = set()
+        for entry in glossary_additions:
+            term = entry.get("term", "").strip()
+            if term:
+                new_terms.add(term)
+        if new_terms:
+            print(f"  Reprocessing with updated glossary ({len(new_terms)} new terms)...")
+            fake_args = argparse.Namespace(work_dir=str(work_dir))
+            cmd_reprocess(fake_args, new_terms=new_terms)
 
     # No sentinel cleanup needed: cmd_reprocess already updates
     # _corrected.json content with new glossary terms for ALL chapters
@@ -2043,7 +2092,7 @@ def cmd_prepare_round3(args):
     return 0
 
 
-def cmd_reprocess(args):
+def cmd_reprocess(args, new_terms=None):
     """Re-run preprocess with updated glossary (second pass).
 
     Use case: Claude identifies new term inconsistencies during phase C
@@ -2052,6 +2101,10 @@ def cmd_reprocess(args):
 
     Reads original extracted text (chapter_NNNN.json), re-applies
     proofread_text with current glossary, and overwrites _preprocessed.json.
+
+    When new_terms is provided (set of term strings), only chapters whose
+    original text contains at least one new term are reprocessed. Chapters
+    without any new term are skipped, avoiding wasted I/O for large books.
     """
     work_dir = Path(args.work_dir)
     extracted_dir = work_dir / "extracted"
@@ -2098,6 +2151,12 @@ def cmd_reprocess(args):
 
         with open(orig_path, "r", encoding="utf-8") as f:
             chapter_data = json.load(f)
+
+        # Selective reprocess: skip chapters without new terms
+        if new_terms:
+            ch_text = "".join(s.get("content", "") for s in chapter_data.get("segments", []))
+            if not any(t in ch_text for t in new_terms):
+                continue
 
         proofread_segments = []
         quote_state = {"left": True}  # persist quote parity across segments
