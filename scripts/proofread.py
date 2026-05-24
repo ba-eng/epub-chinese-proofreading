@@ -628,11 +628,10 @@ def _detect_round3_patterns(text):
     # 其 followed by CJK char (not in 其他/其它/其中/其实/其余/其次/尤其/及其)
     if re.search(r'(?<![尤与及])其(?!他|她|它|中|实|余|次)', text):
         tl.append("其(代词)")
-    # Pattern 7: 被动语态过滥 — 被 + verb (≥2 occurrences, exclude fixed compounds)
-    bei_hits = re.findall(r'被(?!迫|动|告|捕|害|控|诉|称|选举|认为)', text)
-    bei_unique = set(bei_hits) if bei_hits else set()
-    if len(bei_hits) >= 2:
-        tl.append(f"被动语态({len(bei_hits)}处)")
+    # Pattern 7: 被动语态过滥（「被人们」「被大家」等泛化施动者）
+    # — NOT all 被-sentences; normal passive ("被打了") is fine Chinese.
+    if re.search(r'被(?:人们|大家|所有人|众人|世人|他人|别人)', text):
+        tl.append("被动过滥(被人们/被大家)")
     if tl:
         result["翻译腔"] = tl
 
