@@ -607,29 +607,23 @@ def _detect_round3_patterns(text):
     """
     result = {}
 
-    # 1. Translationese patterns — all 7 patterns from SKILL.md Round 3 P1
+    # 1. Translationese patterns — 4 confirmed patterns
     tl = []
+    # Pattern 1: 被……所…… — modern Europeanized construct (古汉语只用「为……所……」)
     if re.search(r'被.{1,20}所', text):
         tl.append("被……所……")
+    # Pattern 2: 开始……起来 — double inceptive (汉语只需一个)
     if re.search(r'开始.{1,30}起来', text):
         tl.append("开始……起来")
-    if re.search(r'着[\u4e00-\u9fff]{1,20}着', text):
-        tl.append("……着……着")
-    # Pattern 4: 是……的 (at least 4 CJK chars between, to skip "是我的")
-    if re.search(r'是[\u4e00-\u9fff]{4,30}的', text):
-        tl.append("是……的")
-    # Pattern 5: 一个……的 (adjectival clustering)
-    if re.search(r'一个[\u4e00-\u9fff]{1,25}的', text):
-        tl.append("一个……的")
-    # Pattern 6: 过于正式的代词 (该/其 as standalone formal pronoun)
+    # Pattern 3: 过于正式的代词 (该/其 as standalone formal pronoun)
     # 该 followed by CJK char (not in compounds like 应该/活该)
     if re.search(r'(?<![应活])该[\u4e00-\u9fff]', text):
         tl.append("该(代词)")
     # 其 followed by CJK char (not in 其他/其它/其中/其实/其余/其次/尤其/及其)
     if re.search(r'(?<![尤与及])其(?!他|她|它|中|实|余|次)', text):
         tl.append("其(代词)")
-    # Pattern 7: 被动语态过滥（「被人们」「被大家」等泛化施动者）
-    # — NOT all 被-sentences; normal passive ("被打了") is fine Chinese.
+    # Pattern 4: 被动语态过滥（「被人们」「被大家」等泛化施动者）
+    # NOT all 被-sentences; normal passive ("被打了") is fine Chinese.
     if re.search(r'被(?:人们|大家|所有人|众人|世人|他人|别人)', text):
         tl.append("被动过滥(被人们/被大家)")
     if tl:
