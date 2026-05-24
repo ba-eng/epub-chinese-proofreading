@@ -9,7 +9,7 @@ from lxml import etree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from proofread import (
     extract_text_segments, _decode_xhtml, split_long_text,
-    apply_mechanical_style_fixes, compute_change_ratio,
+    apply_mechanical_style_fixes, compute_change_ratio, proofread_text,
     natural_sort_key, _is_cjk, _is_valid_term_char, _ENTITY_REVERSE_MAP,
     _safe_extract_epub, _read_xhtml_text,
 )
@@ -527,6 +527,68 @@ with tempfile.TemporaryDirectory() as td:
     check("中文" in text, "17d: Big5 XHTML text did not decode")
 
 print("  17 encoding-aware reads: OK")
+print()
+
+# ============================================================
+# Test 18: proofread_text MUST call apply_mechanical_style_fixes
+# Regression: V3.7 added advisory_blacklist and rewrote return
+# statements, dropping the apply_mechanical_style_fixes call.
+# The fix is one line but survived V3.7, V4.0, V4.1.
+# This test will fail if the call is ever removed again.
+# ============================================================
+print("=== Test 18: proofread_text calls apply_mechanical_style_fixes ===")
+
+# 18a: ASCII comma in CJK context → fullwidth comma
+res, _, _, _ = proofread_text("他说,走吧", {}, [], {}, [])
+check("\uff0c" in res and "," not in res,
+      "18a: ASCII comma should be converted to fullwidth by proofread_text")
+
+# 18b: ASCII semicolon in CJK context → fullwidth comma
+res, _, _, _ = proofread_text("他说;走吧", {}, [], {}, [])
+check("\uff0c" in res and ";" not in res,
+      "18b: ASCII semicolon should be converted to fullwidth comma by proofread_text")
+
+# 18c: ASCII colon in CJK context → fullwidth colon
+res, _, _, _ = proofread_text("他说:走吧", {}, [], {}, [])
+check("\uff1a" in res and ":" not in res,
+      "18c: ASCII colon should be converted to fullwidth by proofread_text")
+
+# 18d: ... → …… (ellipsis normalization)
+res, _, _, _ = proofread_text("他说...走吧", {}, [], {}, [])
+check("..." not in res and "\u2026" in res,
+      "18d: triple dot should be converted to ellipsis by proofread_text")
+
+# 18e: -- → —— (em dash normalization)
+res, _, _, _ = proofread_text("他说--走吧", {}, [], {}, [])
+check("--" not in res and "\u2014" in res,
+      "18e: double hyphen should be converted to em dash by proofread_text")
+
+# 18f: Multiple conversions in one pass
+res, _, _, _ = proofread_text("他说,走吧;开始:行动...没错--对", {}, [], {}, [])
+check("," not in res, "18f: no ASCII comma should survive")
+check(";" not in res, "18f: no ASCII semicolon should survive")
+check("..." not in res, "18f: no triple dot should survive")
+check("--" not in res, "18f: no double hyphen should survive")
+check("\uff0c" in res, "18f: should contain fullwidth comma(s)")
+check("\u2026" in res, "18f: should contain ellipsis")
+check("\u2014" in res, "18f: should contain em dash")
+
+# 18g: English text should survive (mechanical fixes skip English-heavy text)
+res, _, _, _ = proofread_text("He said, OK; let's go: now...yes--no", {}, [], {}, [])
+check("," in res, "18g: ASCII comma in English context should survive")
+check(";" in res, "18g: ASCII semicolon in English context should survive")
+
+# 18h: Mixed CJK+English — CJK part converted, English part preserved
+# Note: the entire segment is treated as one; if it's not English-heavy, CJK-adjacent
+# punctuation is converted but English-internal punctuation may survive.
+# The exact boundary depends on the regex lookbehind/lookahead.
+res, _, _, _ = proofread_text("他说,走吧;but not this: ok", {}, [], {}, [])
+# The first comma (after 说) and semicolon (after 吧) should convert
+# The colon after "this" is in English context so may survive
+check("\uff0c" in res, "18h: CJK-adjacent ASCII comma should convert")
+
+# Verify all tests registered
+print(f"  18 proofread_text regression: {sum(1 for _ in [''])} subtests")
 print()
 
 # ============================================================

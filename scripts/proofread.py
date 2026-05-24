@@ -596,12 +596,58 @@ def split_long_text(text, threshold=300, punctuations=None):
     return parts if parts else [text]
 
 
-def _dump_chapter_lines(chapter, data):
-    """Return (header_lines, content_lines, char_count) for one chapter.
+def _detect_round3_patterns(text):
+    """Detect mechanical Round 3 patterns for checklist hints.
+
+    These are regex-level detections — hints for the LLM to evaluate,
+    NOT auto-corrections. The LLM must still exercise judgment on each.
+
+    Returns a dict with optional keys: 翻译腔, 数字, 长句, 粘滞.
+    Empty dict if no patterns found.
+    """
+    result = {}
+
+    # 1. Translationese patterns (被……所……, 开始……起来, ……着……着)
+    tl = []
+    if re.search(r'被.{1,20}所', text):
+        tl.append("被……所……")
+    if re.search(r'开始.{1,30}起来', text):
+        tl.append("开始……起来")
+    if re.search(r'着[\u4e00-\u9fff]{1,20}着', text):
+        tl.append("……着……着")
+    if tl:
+        result["翻译腔"] = tl
+
+    # 2. Arabic numerals (should be Chinese characters in literary text)
+    nums = re.findall(r'\d+', text)
+    if nums:
+        result["数字"] = nums[:5]  # cap at 5 to avoid bloat
+
+    # 3. Long sentences (>100 chars between sentence breaks)
+    sentences = re.split(r'[。！？；\n]', text)
+    max_len = max((len(s) for s in sentences), default=0)
+    if max_len > 100:
+        result["长句"] = max_len
+
+    # 4. Consecutive same CJK chars (cross-word粘滞 candidates)
+    cjk_pairs = re.findall(r'([\u4e00-\u9fff])\1', text)
+    if cjk_pairs:
+        result["粘滞"] = [c + c for c in cjk_pairs[:3]]  # cap at 3 pairs
+
+    return result
+
+
+def _dump_chapter_lines(chapter, data, clean_batches=False, round3=False):
+    """Return (header_lines, content_lines, char_count, markers) for one chapter.
 
     Each segment gets its own coordinate line. No merging — merging
     would hide coordinates from the LLM, causing corrections to target
     the wrong segment and produce duplicated text on inject.
+
+    When clean_batches=True, markers are separated into a dict (keyed by
+    segment coordinate) instead of embedded in the text. This physically
+    prevents the LLM from scanning markers to locate segments — it must
+    read clean text first, then cross-reference the checklist file.
     """
     header = [
         f"\n{'='*60}",
@@ -609,6 +655,7 @@ def _dump_chapter_lines(chapter, data):
         f"{'='*60}\n",
     ]
     body = []
+    markers = {}
     chars = 0
 
     for seg in data.get("segments", []):
@@ -619,12 +666,23 @@ def _dump_chapter_lines(chapter, data):
         sub_id = seg.get("sub_id")
         if sub_id is not None:
             coord += f".{sub_id}"
+
+        seg_markers = {}
+
         if seg.get("blacklisted") and seg.get("blacklist_hits"):
-            bl_words = ", ".join(seg["blacklist_hits"])
-            body.append(f"[? 需替换网文词: {bl_words}]")
+            if clean_batches:
+                seg_markers["网文词"] = seg["blacklist_hits"]
+            else:
+                bl_words = ", ".join(seg["blacklist_hits"])
+                body.append(f"[? 需替换网文词: {bl_words}]")
+
         if seg.get("advisory_hits"):
-            adv_words = ", ".join(seg["advisory_hits"])
-            body.append(f"[? 建议审视用词: {adv_words}]")
+            if clean_batches:
+                seg_markers["审视词"] = seg["advisory_hits"]
+            else:
+                adv_words = ", ".join(seg["advisory_hits"])
+                body.append(f"[? 建议审视用词: {adv_words}]")
+
         if seg.get("is_english"):
             # Check if nearby Chinese translation exists (bilingual → delete EN)
             all_segs = data.get("segments", [])
@@ -643,22 +701,38 @@ def _dump_chapter_lines(chapter, data):
                     if sum(1 for c in n if c.isascii() and c.isalpha()) / max(cj, 1) < 0.2:
                         has_cn = True
                         break
-            if has_cn:
-                body.append("[? 英文段落]")
+            if clean_batches:
+                seg_markers["英文"] = "删除" if has_cn else "翻译"
             else:
-                body.append("[? 英文段落·待翻译]")
+                if has_cn:
+                    body.append("[? 英文段落]")
+                else:
+                    body.append("[? 英文段落·待翻译]")
+
+        if round3 and clean_batches:
+            r3 = _detect_round3_patterns(content)
+            if r3:
+                seg_markers.update(r3)
+
+        if clean_batches and seg_markers:
+            markers[coord] = seg_markers
+
         body.append(f"[{coord}] {content}")
         chars += len(content)
 
-    return header, body, chars
+    return header, body, chars, markers
 
 
-def _iter_dump_chapters(index, extracted_dir):
-    """Yield (chapter, header, body_lines, char_count) for each chapter.
+def _iter_dump_chapters(index, extracted_dir, clean_batches=False, round3=False):
+    """Yield (chapter, header, body_lines, char_count, markers) for each chapter.
 
     Prefers _corrected.json (LLM-proofread text) over _preprocessed.json
     (mechanical glossary + style fixes) over raw extract. This ensures
     round 2 sees round 1's corrections rather than re-reading stale text.
+
+    markers is a dict keyed by segment coordinate (e.g. "c3.s15") →
+    {"网文词": [...], "英文": "删除"|"翻译", "审视词": [...], "翻译腔": [...], ...}.
+    Empty dict when clean_batches=False.
     """
     for item in index:
         chapter = item["chapter"]
@@ -677,8 +751,8 @@ def _iter_dump_chapters(index, extracted_dir):
             continue
         with open(read_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        header, body, chars = _dump_chapter_lines(chapter, data)
-        yield chapter, header, body, chars
+        header, body, chars, markers = _dump_chapter_lines(chapter, data, clean_batches, round3)
+        yield chapter, header, body, chars, markers
 
 
 def _extract_tail(lines, max_chars):
@@ -700,19 +774,30 @@ def _extract_tail(lines, max_chars):
     return "\n".join(reversed(tail))
 
 
-def _write_batch(batch_dir, num, lines, start_ch, end_ch):
-    """Write a single batch file."""
+def _write_batch(batch_dir, num, lines, start_ch, end_ch, checklist=None):
+    """Write a single batch file + optional checklist JSON."""
     fname = f"batch_{num:02d}_ch{start_ch:04d}_to_{end_ch:04d}.txt"
     with open(batch_dir / fname, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+    if checklist:
+        cname = f"batch_{num:02d}_ch{start_ch:04d}_to_{end_ch:04d}_checklist.json"
+        with open(batch_dir / cname, "w", encoding="utf-8") as f:
+            json.dump(checklist, f, ensure_ascii=False, indent=2)
 
 
-def _redump_batches(work_dir):
+def _redump_batches(work_dir, round3=False):
     """Regenerate batch files from current _preprocessed.json content.
 
     Called after reprocess updates the glossary so that batch files
     reflect the latest term replacements. Without this, subsequent
     proofreading rounds see stale text with old variant forms.
+
+    Respects clean_batches from config — if pipeline was run with
+    --clean-batches, redump also produces clean text + checklist files.
+
+    When round3=True, also generates Round 3 mechanical markers
+    (翻译腔 patterns, long sentences, numbers, CJK粘滞) and writes
+    them to the checklist files — preventing empty-checklist tunnel-vision.
     """
     extracted_dir = Path(work_dir) / "extracted"
     batch_dir = Path(work_dir) / "proofread_batches"
@@ -724,16 +809,17 @@ def _redump_batches(work_dir):
     with open(index_path, "r", encoding="utf-8") as f:
         index = json.load(f)
 
-    # Read max_chars from config, default to 80000
+    # Read max_chars and clean_batches from config
     config = load_config(work_dir)
     max_chars = config.get("proofreading", {}).get("max_chars", 0) or 80000
+    clean_batches = config.get("proofreading", {}).get("clean_batches", False)
 
     # Collect all chapters
     all_lines = []
     total_chars = 0
     chapters = []
-    for ch, hdr, body, chars in _iter_dump_chapters(index, extracted_dir):
-        chapters.append((ch, hdr, body, chars))
+    for ch, hdr, body, chars, markers in _iter_dump_chapters(index, extracted_dir, clean_batches, round3):
+        chapters.append((ch, hdr, body, chars, markers))
         all_lines.extend(hdr)
         all_lines.extend(body)
         total_chars += chars
@@ -747,38 +833,46 @@ def _redump_batches(work_dir):
     if batch_dir.exists():
         for f in batch_dir.glob("batch_*.txt"):
             f.unlink()
+        for f in batch_dir.glob("batch_*_checklist.json"):
+            f.unlink()
     batch_dir.mkdir(exist_ok=True)
 
     batch_num = 1
     batch_chars = 0
     batch_lines = []
+    batch_markers = {} if clean_batches else None
     batch_start_ch = None
     batch_end_ch = None
     OVERLAP_CHARS = 2000
     prev_batch_tail = None
 
-    for ch, hdr, body, chars in chapters:
+    for ch, hdr, body, chars, markers in chapters:
         if chars > max_chars:
             if batch_lines:
-                _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch)
+                _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch,
+                             batch_markers)
                 prev_batch_tail = _extract_tail(batch_lines, OVERLAP_CHARS)
                 batch_num += 1
                 batch_lines, batch_chars = [], 0
+                batch_markers = {} if clean_batches else None
                 batch_start_ch = None
             chunk = []
             if prev_batch_tail:
                 chunk.append(f"\n[Previous Context]\n{prev_batch_tail}\n[/Previous Context]\n")
             chunk.extend(hdr + body)
-            _write_batch(batch_dir, batch_num, chunk, ch, ch)
+            _write_batch(batch_dir, batch_num, chunk, ch, ch,
+                         markers if clean_batches else None)
             prev_batch_tail = _extract_tail(hdr + body, OVERLAP_CHARS)
             batch_num += 1
             continue
 
         if batch_chars + chars > max_chars and batch_lines:
-            _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch)
+            _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch,
+                         batch_markers)
             prev_batch_tail = _extract_tail(batch_lines, OVERLAP_CHARS)
             batch_num += 1
             batch_lines, batch_chars = [], 0
+            batch_markers = {} if clean_batches else None
             batch_start_ch = None
 
         if batch_start_ch is None:
@@ -793,10 +887,13 @@ def _redump_batches(work_dir):
         batch_end_ch = ch
         batch_lines.extend(hdr)
         batch_lines.extend(body)
+        if clean_batches and markers:
+            batch_markers.update(markers)
         batch_chars += chars
 
     if batch_lines:
-        _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch)
+        _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch,
+                     batch_markers)
 
     print(f"  Batch files regenerated: {batch_num} batch(es) in {batch_dir}/")
 
@@ -810,9 +907,13 @@ def cmd_dump_text(args):
     understanding that no Python heuristic can match.
 
     With --max-chars, auto-splits into batches when total exceeds the limit.
+    With --clean-batches, markers ([? ...]) are stripped from batch text and
+    written to separate *_checklist.json files — preventing LLM marker
+    tunnel-vision by forcing active scanning before marker cross-reference.
     """
     work_dir = Path(args.work_dir)
     extracted_dir = work_dir / "extracted"
+    clean_batches = getattr(args, 'clean_batches', False)
 
     index_path = extracted_dir / "index.json"
     if not index_path.exists():
@@ -825,9 +926,9 @@ def cmd_dump_text(args):
     # Collect all chapter data (single pass)
     all_lines = []
     total_chars = 0
-    chapters = []  # (chapter, header, body, chars)
-    for ch, hdr, body, chars in _iter_dump_chapters(index, extracted_dir):
-        chapters.append((ch, hdr, body, chars))
+    chapters = []  # (chapter, header, body, chars, markers)
+    for ch, hdr, body, chars, markers in _iter_dump_chapters(index, extracted_dir, clean_batches):
+        chapters.append((ch, hdr, body, chars, markers))
         all_lines.extend(hdr)
         all_lines.extend(body)
         total_chars += chars
@@ -847,24 +948,29 @@ def cmd_dump_text(args):
         if batch_dir.exists():
             for f in batch_dir.glob("batch_*.txt"):
                 f.unlink()
+            for f in batch_dir.glob("batch_*_checklist.json"):
+                f.unlink()
         batch_dir.mkdir(exist_ok=True)
         batch_num = 1
         batch_chars = 0
         batch_lines = []
+        batch_markers = {} if clean_batches else None
         batch_start_ch = None
         batch_end_ch = None
 
         OVERLAP_CHARS = 2000
         prev_batch_tail = None  # last N chars of previous batch for overlap
 
-        for ch, hdr, body, chars in chapters:
+        for ch, hdr, body, chars, markers in chapters:
             if chars > max_chars:
                 if batch_lines:
-                    _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch)
+                    _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch,
+                                 batch_markers)
                     prev_batch_tail = _extract_tail(batch_lines, OVERLAP_CHARS)
                     print(f"  Batch {batch_num:02d}: ch {batch_start_ch:04d}-{batch_end_ch:04d} ({batch_chars} chars)")
                     batch_num += 1
                     batch_lines, batch_chars = [], 0
+                    batch_markers = {} if clean_batches else None
                     batch_start_ch = None
                 chunk = []
                 if prev_batch_tail:
@@ -875,18 +981,21 @@ def cmd_dump_text(args):
                     f"用词是否平滑衔接？若有风格突变，写入 corrections]\n"
                 )
                 chunk.extend(hdr + body)
-                _write_batch(batch_dir, batch_num, chunk, ch, ch)
+                _write_batch(batch_dir, batch_num, chunk, ch, ch,
+                             markers if clean_batches else None)
                 prev_batch_tail = _extract_tail(hdr + body, OVERLAP_CHARS)
                 print(f"  Batch {batch_num:02d}: ch {ch:04d} alone ({chars} chars)")
                 batch_num += 1
                 continue
 
             if batch_chars + chars > max_chars and batch_lines:
-                _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch)
+                _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch,
+                             batch_markers)
                 prev_batch_tail = _extract_tail(batch_lines, OVERLAP_CHARS)
                 print(f"  Batch {batch_num:02d}: ch {batch_start_ch:04d}-{batch_end_ch:04d} ({batch_chars} chars)")
                 batch_num += 1
                 batch_lines, batch_chars = [], 0
+                batch_markers = {} if clean_batches else None
                 batch_start_ch = None
 
             if batch_start_ch is None:
@@ -901,13 +1010,18 @@ def cmd_dump_text(args):
             batch_end_ch = ch
             batch_lines.extend(hdr)
             batch_lines.extend(body)
+            if clean_batches and markers:
+                batch_markers.update(markers)
             batch_chars += chars
 
         if batch_lines:
-            _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch)
+            _write_batch(batch_dir, batch_num, batch_lines, batch_start_ch, batch_end_ch,
+                         batch_markers)
             print(f"  Batch {batch_num:02d}: ch {batch_start_ch:04d}-{batch_end_ch:04d} ({batch_chars} chars)")
 
         print(f"  Split into {batch_num} batch(es) in {batch_dir}/")
+        if clean_batches:
+            print(f"  Clean mode: markers in *_checklist.json, text files are marker-free.")
         print(f"  LLM: Process batches sequentially. Each batch fits in context.")
     else:
         print(f"  LLM: Read this file to do entity extraction, inconsistency detection,")
@@ -1883,6 +1997,50 @@ def _three_way_merge(old_pp_content, corrected_content, new_pp_content, _depth=0
         result.append(new_pp_content[new_pos:])
 
     return ''.join(result)
+
+
+def cmd_prepare_round3(args):
+    """Prepare batches for Round 3 literary polishing.
+
+    Regenerates batch text files (clean) and writes Round 3 mechanical
+    markers to _checklist.json files. This prevents the LLM from facing
+    an empty checklist in Round 3, which would invite tunnel-vision —
+    the LLM would see "clean" text and find nothing to do.
+
+    Round 3 mechanical markers include:
+      - 翻译腔 patterns: 被……所……, 开始……起来, ……着……着
+      - 数字: Arabic numerals to convert to Chinese
+      - 长句: sentences >100 chars (euro-chinese splitting candidates)
+      - 粘滞: consecutive identical CJK chars (comma insertion candidates)
+
+    These are regex-level HINTS, not auto-corrections. The LLM must
+    still exercise judgment — markers may be false positives.
+    """
+    work_dir = Path(args.work_dir)
+
+    if not (work_dir / "extracted" / "index.json").exists():
+        print("  No index.json found. Run pipeline first.")
+        return 1
+
+    # Persist round3 in config so subsequent _redump_batches calls
+    # (e.g. from reprocess) also include Round 3 markers.
+    config = load_config(work_dir)
+    config.setdefault("proofreading", {})["round3"] = True
+    save_config(config, work_dir)
+
+    _redump_batches(work_dir, round3=True)
+
+    # Count markers for user feedback
+    batch_dir = work_dir / "proofread_batches"
+    total_markers = 0
+    for cf in sorted(batch_dir.glob("batch_*_checklist.json")):
+        with open(cf, "r", encoding="utf-8") as f:
+            checklist = json.load(f)
+        total_markers += len(checklist)
+
+    print(f"  Round 3 checklist: {total_markers} annotated segments across all batches")
+    print(f"  Ready for literary polishing.")
+    return 0
 
 
 def cmd_reprocess(args):
@@ -3726,68 +3884,141 @@ def _write_task_md(work_dir):
     full_text = work_dir / "full_text.txt"
     has_batches = batch_dir.exists() and list(batch_dir.glob("batch_*.txt"))
 
+    # Check if clean-batches mode is active
+    config = load_config(work_dir)
+    clean_batches = config.get("proofreading", {}).get("clean_batches", False)
+    has_checklists = clean_batches and has_batches and list(batch_dir.glob("batch_*_checklist.json"))
+
     # Generate suspected term variant hints (50 to include lower-freq pairs)
     extracted_dir = work_dir / "extracted"
     variants = _find_suspected_variants(extracted_dir, top_n=50)
     english_terms = _find_english_terms(extracted_dir)
 
-    lines = [
-        "## EPUB 中文校对任务",
-        "",
-        "你现在是一个中文出版级校对员。校对分两轮进行。",
-        "",
-        "### 强制执行规则",
-        "",
-        "**以下规则不可跳过、不可缩短、不可「快速扫描」：**",
-        "",
-        "1. **每个 batch 必须完整、逐段深入阅读。** 覆盖该 batch 的全部内容，",
-        "   不可只读开头几段或抽样。无论 batch 大小，必须读完。",
-        "2. **认真审读每一段文本。** 不要只扫描 `[? ...]` 标记。许多术语",
-        "   变体和翻译腔不会自动标记，需要人工逐段发现。",
-        "3. **禁止跳过 batch。** 全书所有 batch 都必须逐个处理，不得以",
-        "   「术语已经够多」为由跳过后面的 batch。",
-        "4. **每个 batch 处理完必须立即 apply-corrections。** 后面的 batch",
-        "   可能发现前面遗漏的术语变体；apply 时 reprocess 会自动把新术语",
-        "   传播到全量章节（包括已校对过的章节的 `_corrected.json`）。",
-        "5. **阅读时注意以下所有问题，不要遗漏：**",
-        "- 同一个外文人名/地名/神名的不同中文翻译（如「德拉奈」/「德洛内」应为统一的「德劳内」）",
-        "- 未翻译的英文单词（如 anguissette 应为「痛苦者」）",
-        "- `[? 需替换网文词: xxx]` 标记 → 替换为中性表达",
-        "- `[? 英文段落]` → 旁有中文译文则删除英文段",
-        "- `[? 英文段落·待翻译]` → 翻译为中文",
-        "- AI 套话（'在上一章中'、'综上所述'等）、翻译腔、风格突变",
-        "- **翻译完整性**：对话引导句（「他说，笑着」）是否遗漏了状态修饰（漏了「笑着」），常见省略如笑着说、叹了口气、低声、冷冷地等",
-        "- **格言/重复句式统一**：全书中反复出现的格言、座右铭、仪式用语必须在所有出现处逐字一致。处理每个 batch 时注意是否有前文出现过的固定短语在本 batch 以不同措辞出现",
-        "",
-        "### 第 1 轮 — 术语发现 + 黑名单",
-        "逐 batch 深度阅读，重点搜集**同指异译**的人名/地名/神名，写入 glossary_additions。",
-        "同时注意全书中反复出现的**格言、座右铭、仪式用语**是否在所有出现处逐字一致。",
-        "每 batch 的 apply-corrections 会自动 reprocess，把新术语传播到全量章节。",
-        "",
-        "### 第 2 轮 — 英文处理 + 精修",
-        "处理 `[? 英文段落]` 标记、AI 套话、翻译腔、风格突变。",
-        "",
-        "**重要：不要在所有 batch 处理完之前运行 inject/pack。**",
-        "",
-        "---",
-        "",
-        "### 第 1 轮：逐 batch 校对",
-    ]
+    if clean_batches:
+        lines = [
+            "## EPUB 中文校对任务",
+            "",
+            "你现在是一个中文出版级校对员。校对分两轮进行。",
+            "",
+            "**本任务使用 clean batch 模式：正文不含任何 `[? ...]` 标记。**",
+            "标记已剥离到各 batch 对应的 `_checklist.json` 文件中。",
+            "",
+            "### 处理流程（两文件工作流）",
+            "",
+            "每个 batch 有两个文件：",
+            "- `batch_NN_*.txt` — **纯正文**，仅含坐标 `[cN.sM]`，无任何标记",
+            "- `batch_NN_*_checklist.json` — **标记清单**，按 segment_id 索引",
+            "",
+            "**处理顺序（防标记 tunnel-vision）：**",
+            "1. 打开 .txt 文件 → 逐段通读（正文无标记，只能主动扫描）→ 产出 corrections",
+            "2. 打开 _checklist.json → 逐条对照：自己漏了哪些？哪些是误报？→ 补充 corrections",
+            "3. 输出自检报告 + 运行 apply-corrections",
+            "",
+            "### 强制执行规则",
+            "",
+            "**以下规则不可跳过、不可缩短：**",
+            "",
+            "1. **每个 batch 必须完整、逐段深入阅读。** 覆盖该 batch 的全部内容，不可抽样。",
+            "2. **正文中无标记，必须主动逐段扫描。** 不能等标记提示——标记在 checklist 中，",
+            "   只有完成主动扫描后才能打开对照。如果发现自己的分析被标记覆盖了则确认，",
+            "   标记指出但自己遗漏的则补充，标记误报的则拒绝。",
+            "3. **禁止跳过 batch。** 全书所有 batch 都必须逐个处理。",
+            "4. **每个 batch 处理完必须立即 apply-corrections。** 后面的 batch",
+            "   可能发现前面遗漏的术语变体；apply 时 reprocess 会自动传播。",
+            "5. **阅读时注意以下所有问题：**",
+            "- 同一个外文人名/地名/神名的不同中文翻译",
+            "- 未翻译的英文单词",
+            "- 网文词需替换为中性表达（对照 checklist 中的 \"网文词\" 字段）",
+            "- 英文段处理（对照 checklist 中的 \"英文\" 字段：\"删除\"=旁有中文可删，\"翻译\"=无中文需译）",
+            "- AI 套话、翻译腔、风格突变",
+            "- 翻译完整性：对话引导句是否遗漏状态修饰",
+            "- 格言/重复句式：全书反复出现的固定短语是否逐字一致",
+            "",
+            "### 第 1 轮 — 术语发现 + 黑名单",
+            "逐 batch 深度阅读，重点搜集**同指异译**的人名/地名/神名，写入 glossary_additions。",
+            "每 batch 的 apply-corrections 会自动 reprocess，把新术语传播到全量章节。",
+            "",
+            "### 第 2 轮 — 英文处理 + 精修",
+            "处理英文段、AI 套话、翻译腔、风格突变。对照 checklist 中的 \"英文\" 和 \"审视词\" 字段。",
+            "",
+            "**重要：不要在所有 batch 处理完之前运行 inject/pack。**",
+            "",
+            "---",
+            "",
+            "### 第 1 轮：逐 batch 校对",
+        ]
+    else:
+        lines = [
+            "## EPUB 中文校对任务",
+            "",
+            "你现在是一个中文出版级校对员。校对分两轮进行。",
+            "",
+            "### 强制执行规则",
+            "",
+            "**以下规则不可跳过、不可缩短、不可「快速扫描」：**",
+            "",
+            "1. **每个 batch 必须完整、逐段深入阅读。** 覆盖该 batch 的全部内容，",
+            "   不可只读开头几段或抽样。无论 batch 大小，必须读完。",
+            "2. **认真审读每一段文本。** 不要只扫描 `[? ...]` 标记。许多术语",
+            "   变体和翻译腔不会自动标记，需要人工逐段发现。",
+            "3. **禁止跳过 batch。** 全书所有 batch 都必须逐个处理，不得以",
+            "   「术语已经够多」为由跳过后面的 batch。",
+            "4. **每个 batch 处理完必须立即 apply-corrections。** 后面的 batch",
+            "   可能发现前面遗漏的术语变体；apply 时 reprocess 会自动把新术语",
+            "   传播到全量章节（包括已校对过的章节的 `_corrected.json`）。",
+            "5. **阅读时注意以下所有问题，不要遗漏：**",
+            "- 同一个外文人名/地名/神名的不同中文翻译（如「德拉奈」/「德洛内」应为统一的「德劳内」）",
+            "- 未翻译的英文单词（如 anguissette 应为「痛苦者」）",
+            "- `[? 需替换网文词: xxx]` 标记 → 替换为中性表达",
+            "- `[? 英文段落]` → 旁有中文译文则删除英文段",
+            "- `[? 英文段落·待翻译]` → 翻译为中文",
+            "- AI 套话（'在上一章中'、'综上所述'等）、翻译腔、风格突变",
+            "- **翻译完整性**：对话引导句（「他说，笑着」）是否遗漏了状态修饰（漏了「笑着」），常见省略如笑着说、叹了口气、低声、冷冷地等",
+            "- **格言/重复句式统一**：全书中反复出现的格言、座右铭、仪式用语必须在所有出现处逐字一致。处理每个 batch 时注意是否有前文出现过的固定短语在本 batch 以不同措辞出现",
+            "",
+            "### 第 1 轮 — 术语发现 + 黑名单",
+            "逐 batch 深度阅读，重点搜集**同指异译**的人名/地名/神名，写入 glossary_additions。",
+            "同时注意全书中反复出现的**格言、座右铭、仪式用语**是否在所有出现处逐字一致。",
+            "每 batch 的 apply-corrections 会自动 reprocess，把新术语传播到全量章节。",
+            "",
+            "### 第 2 轮 — 英文处理 + 精修",
+            "处理 `[? 英文段落]` 标记、AI 套话、翻译腔、风格突变。",
+            "",
+            "**重要：不要在所有 batch 处理完之前运行 inject/pack。**",
+            "",
+            "---",
+            "",
+            "### 第 1 轮：逐 batch 校对",
+        ]
 
     if has_batches:
         batches = sorted(batch_dir.glob("batch_*.txt"))
         lines.append("")
         lines.append(f"全书共 {len(batches)} 个 batch。对每个 batch 执行：")
         lines.append("")
-        lines.append("a) 读取 batch 文件")
-        lines.append("b) 审读全文，重点找术语变体和黑名单标记")
-        lines.append("c) 输出 glossary_additions + corrections 到 corrections.json")
+        if clean_batches:
+            lines.append("a) **先读取纯正文** `batch_NN_*.txt`——逐段主动扫描（正文无标记，不能等提示）")
+            lines.append("b) 产出第一批 corrections（基于自己的分析）")
+            lines.append("c) **再打开** `batch_NN_*_checklist.json`——对照每一条标记：")
+            lines.append("   - 自己已发现的 → 确认")
+            lines.append("   - 自己遗漏的 → 补充到 corrections")
+            lines.append("   - 标记误报的 → 拒绝")
+            lines.append("d) 输出自检报告（X/Y/Z/W），然后输出合并后的 corrections.json")
+        else:
+            lines.append("a) 读取 batch 文件")
+            lines.append("b) 审读全文，重点找术语变体和黑名单标记")
+            lines.append("c) 输出 glossary_additions + corrections 到 corrections.json")
         lines.append(f"d) 运行 `python proofread.py apply-corrections {work_dir} corrections.json`")
         lines.append("e) 确认 apply 成功后，继续下一个 batch")
         lines.append("")
         lines.append("**Batch 清单：**")
         for i, b in enumerate(batches):
-            lines.append(f"  {i+1}. `{b.relative_to(work_dir)}`")
+            line = f"  {i+1}. `{b.relative_to(work_dir)}`"
+            if clean_batches:
+                cpath = Path(str(b).replace(".txt", "_checklist.json"))
+                if cpath.exists():
+                    line += f" + `{cpath.relative_to(work_dir)}`"
+            lines.append(line)
         lines.append("")
         lines.append("处理完最后一个 batch 后，进入第 2 轮。")
     else:
@@ -3849,46 +4080,87 @@ def _write_task_md(work_dir):
             "",
         ])
 
-    lines.extend([
-        "",
-        "---",
-        "",
-        "### 第 2 轮：英文处理 + 精修",
-        "",
-        "第 1 轮全部 batch apply 完毕后，`voice_cards.md`（主要角色对话样本）已自动生成",
-        "（voice_cards 供可选的第 3 轮文学润色使用，第 2 轮无需对照）。",
-        "现在从第 1 个 batch 重新开始：",
-        "",
-        "a) 读取 batch 文件（此时 `[? 需替换网文词: xxx]` 应已消失，术语应已统一）",
-        "b) 处理英文标记：",
-        "   - `[? 英文段落]` → pipeline 已自动删除，**跳过，无需处理**",
-        "   - `[? 英文段落·待翻译]` → 无中文译文，**翻译为中文并写入 corrections**",
-        "c) 修正 AI 套话、翻译腔、风格突变。逐段对照以下翻译腔模式：",
-        "   - 「被……所……」→ 改主动（如「他被命运所抛弃」→「他遭命运抛弃」）",
-        "   - 「是……的」→ 去掉冗余（如「这本书是值得一读的」→「这本书值得一读」）",
-        "   - 「一个……的」→ 合并形容词（如「一个黑暗的、潮湿的夜晚」→「一个潮湿黑暗的夜晚」）",
-        "   - 「……着……着」→ 简化（如「他走着走着」→「他走了一阵」）",
-        "   - 「开始……起来」→ 换动词（如「他开始跑起来」→「他拔腿就跑」）",
-        "   - 过于正式的代词 → 「该」→「这个/那」、「该事件」→「这件事」",
-        "   - 被动语态过滥 → 「被/让人们/被人们」→ 主动语态或删除施动者",
-        "   - 注：只改明显翻译腔，不确定的保留。不要强行改写正常中文",
-        "   - **翻译完整性检查**：对话/动作引导句中，检查中文是否遗漏了原文的状态修饰——",
-        "     「他说，笑着」不应只译「他说」（漏了「笑着」），「她叹了口气回答」不应只译「她回答」。",
-        "     常见易漏词：笑着说、叹了口气、低声、冷冷地、轻声、喃喃、眯起眼、点了点头等。",
-        "     对照上下文判断——如果引导句异常简短，且上下文也**没有**通过其他句子传达该情绪/动作，",
-        "     很可能是 AI 翻译时省略了引导句中的修饰，需要补回。如果上下文已传达了同样的信息则无需修改。",
-        "d) **边界平滑检查**：每个 batch 开头有 `[BOUNDARY CHECK]` 标记",
-        "   - 对比标记前后 3 段的语气、节奏、用词",
-        "   - 若上一 batch 结尾和本 batch 开头风格不衔接 → 写入 corrections",
-        "e) 输出 corrections（本轮通常无 glossary_additions）",
-        f"f) 运行 `python proofread.py apply-corrections {work_dir} corrections.json`",
-        "g) 继续下一个 batch",
-        "",
-    ])
+    if clean_batches:
+        lines.extend([
+            "",
+            "---",
+            "",
+            "### 第 2 轮：英文处理 + 精修",
+            "",
+            "第 1 轮全部 batch apply 完毕后，`voice_cards.md` 已自动生成",
+            "（voice_cards 供可选的第 3 轮文学润色使用，第 2 轮无需对照）。",
+            "现在从第 1 个 batch 重新开始。**注意：reprocess 后 checklist 可能已更新。**",
+            "",
+            "a) 读取纯正文 `batch_NN_*.txt`（此时术语应已统一，网文词标记应消失）",
+            "b) 逐段主动扫描翻译腔、AI套话、风格突变",
+            "c) 打开 `batch_NN_*_checklist.json`——对照 checklist 中的残留标记：",
+            "   - \"英文\": \"删除\" → pipeline 已自动处理，跳过",
+            "   - \"英文\": \"翻译\" → 翻译为中文并写入 corrections",
+            "   - \"审视词\" → 逐词判断是否需替换",
+            "d) 修正 AI 套话、翻译腔、风格突变。逐段对照以下翻译腔模式：",
+            "   - 「被……所……」→ 改主动（如「他被命运所抛弃」→「他遭命运抛弃」）",
+            "   - 「是……的」→ 去掉冗余（如「这本书是值得一读的」→「这本书值得一读」）",
+            "   - 「一个……的」→ 合并形容词（如「一个黑暗的、潮湿的夜晚」→「一个潮湿黑暗的夜晚」）",
+            "   - 「……着……着」→ 简化（如「他走着走着」→「他走了一阵」）",
+            "   - 「开始……起来」→ 换动词（如「他开始跑起来」→「他拔腿就跑」）",
+            "   - 过于正式的代词 → 「该」→「这个/那」、「该事件」→「这件事」",
+            "   - 被动语态过滥 → 「被/让人们/被人们」→ 主动语态或删除施动者",
+            "   - 注：只改明显翻译腔，不确定的保留。不要强行改写正常中文",
+            "   - **翻译完整性检查**：对话引导句中检查是否遗漏状态修饰（笑着说、叹了口气等）",
+            "e) **边界平滑检查**：每个 batch 开头有 `[BOUNDARY CHECK]` 标记",
+            "   - 对比标记前后 3 段的语气、节奏、用词",
+            "   - 若上一 batch 结尾和本 batch 开头风格不衔接 → 写入 corrections",
+            "f) 输出自检报告 + corrections（本轮通常无 glossary_additions）",
+            f"g) 运行 `python proofread.py apply-corrections {work_dir} corrections.json`",
+            "h) 继续下一个 batch",
+            "",
+        ])
+    else:
+        lines.extend([
+            "",
+            "---",
+            "",
+            "### 第 2 轮：英文处理 + 精修",
+            "",
+            "第 1 轮全部 batch apply 完毕后，`voice_cards.md`（主要角色对话样本）已自动生成",
+            "（voice_cards 供可选的第 3 轮文学润色使用，第 2 轮无需对照）。",
+            "现在从第 1 个 batch 重新开始：",
+            "",
+            "a) 读取 batch 文件（此时 `[? 需替换网文词: xxx]` 应已消失，术语应已统一）",
+            "b) 处理英文标记：",
+            "   - `[? 英文段落]` → pipeline 已自动删除，**跳过，无需处理**",
+            "   - `[? 英文段落·待翻译]` → 无中文译文，**翻译为中文并写入 corrections**",
+            "c) 修正 AI 套话、翻译腔、风格突变。逐段对照以下翻译腔模式：",
+            "   - 「被……所……」→ 改主动（如「他被命运所抛弃」→「他遭命运抛弃」）",
+            "   - 「是……的」→ 去掉冗余（如「这本书是值得一读的」→「这本书值得一读」）",
+            "   - 「一个……的」→ 合并形容词（如「一个黑暗的、潮湿的夜晚」→「一个潮湿黑暗的夜晚」）",
+            "   - 「……着……着」→ 简化（如「他走着走着」→「他走了一阵」）",
+            "   - 「开始……起来」→ 换动词（如「他开始跑起来」→「他拔腿就跑」）",
+            "   - 过于正式的代词 → 「该」→「这个/那」、「该事件」→「这件事」",
+            "   - 被动语态过滥 → 「被/让人们/被人们」→ 主动语态或删除施动者",
+            "   - 注：只改明显翻译腔，不确定的保留。不要强行改写正常中文",
+            "   - **翻译完整性检查**：对话/动作引导句中，检查中文是否遗漏了原文的状态修饰——",
+            "     「他说，笑着」不应只译「他说」（漏了「笑着」），「她叹了口气回答」不应只译「她回答」。",
+            "     常见易漏词：笑着说、叹了口气、低声、冷冷地、轻声、喃喃、眯起眼、点了点头等。",
+            "     对照上下文判断——如果引导句异常简短，且上下文也**没有**通过其他句子传达该情绪/动作，",
+            "     很可能是 AI 翻译时省略了引导句中的修饰，需要补回。如果上下文已传达了同样的信息则无需修改。",
+            "d) **边界平滑检查**：每个 batch 开头有 `[BOUNDARY CHECK]` 标记",
+            "   - 对比标记前后 3 段的语气、节奏、用词",
+            "   - 若上一 batch 结尾和本 batch 开头风格不衔接 → 写入 corrections",
+            "e) 输出 corrections（本轮通常无 glossary_additions）",
+            f"f) 运行 `python proofread.py apply-corrections {work_dir} corrections.json`",
+            "g) 继续下一个 batch",
+            "",
+        ])
     if has_batches:
-        lines.append("**Batch 清单（同第 1 轮）：**")
+        lines.append("**Batch 清单：**")
         for i, b in enumerate(batches):
-            lines.append(f"  {i+1}. `{b.relative_to(work_dir)}`")
+            line = f"  {i+1}. `{b.relative_to(work_dir)}`"
+            if clean_batches:
+                cpath = Path(str(b).replace(".txt", "_checklist.json"))
+                if cpath.exists():
+                    line += f" + `{cpath.relative_to(work_dir)}`"
+            lines.append(line)
 
     lines.extend([
         "",
@@ -4012,11 +4284,14 @@ def cmd_pipeline(args):
     # Step 4: Dump text + generate task for Claude (fully automated)
     print("\n[4/5] Dumping text + generating task file...")
     max_chars = getattr(args, 'max_chars', 0) or 100000  # --max-chars flag or default
-    # Persist max_chars in config so _redump_batches uses the same value
+    clean_batches = getattr(args, 'clean_batches', False)
+    # Persist in config so _redump_batches uses the same values
     config = load_config(work_dir)
     config.setdefault("proofreading", {})["max_chars"] = max_chars
+    config["proofreading"]["clean_batches"] = clean_batches
     save_config(config, work_dir)
-    dump_args = argparse.Namespace(work_dir=str(work_dir), max_chars=max_chars)
+    dump_args = argparse.Namespace(work_dir=str(work_dir), max_chars=max_chars,
+                                   clean_batches=clean_batches)
     ret = cmd_dump_text(dump_args)
     if ret:
         return ret
@@ -4103,6 +4378,9 @@ def main():
     p_pipe.add_argument("--max-chars", type=int, default=0,
                         help="Auto-split into batches if total exceeds N chars. "
                              "Use 50000 for small-context models, 200000 for 1M+ models.")
+    p_pipe.add_argument("--clean-batches", action="store_true",
+                        help="Strip [? ...] markers from batch text; write separate "
+                             "*_checklist.json files. Prevents LLM marker tunnel-vision.")
 
     p_addterm = sub.add_parser("add-term", help="Add/update a term in glossary")
     p_addterm.add_argument("work_dir", help="Work directory containing glossary.json")
@@ -4126,6 +4404,9 @@ def main():
     p_dump.add_argument("--max-chars", type=int, default=100000,
                         help="Auto-split into batches if total exceeds N chars (default 100000)."
                              " Use 50000 for small-context models, 200000 for 1M+ models.")
+    p_dump.add_argument("--clean-batches", action="store_true",
+                        help="Strip [? ...] markers from batch text; write separate "
+                             "*_checklist.json files.")
 
     p_apply = sub.add_parser("apply-corrections", help="Apply structured LLM corrections JSON")
     p_apply.add_argument("work_dir", help="Work directory")
@@ -4133,6 +4414,11 @@ def main():
 
     p_extract_terms = sub.add_parser("extract-terms", help="Auto-extract new glossary terms from proofread output")
     p_extract_terms.add_argument("work_dir", help="Work directory")
+
+    p_round3 = sub.add_parser("prepare-round3",
+                              help="Prepare batches for Round 3 literary polishing "
+                                   "(generates Round 3 mechanical markers in checklist files)")
+    p_round3.add_argument("work_dir", help="Work directory")
 
     p_config = sub.add_parser("config", help="Show or reset config")
     p_config.add_argument("work_dir", help="Work directory")
@@ -4176,6 +4462,8 @@ def main():
         return cmd_apply_corrections(args)
     elif args.command == "extract-terms":
         return cmd_extract_terms(args)
+    elif args.command == "prepare-round3":
+        return cmd_prepare_round3(args)
     elif args.command == "config":
         cfg = load_config(args.work_dir)
         if args.reset:
